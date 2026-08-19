@@ -176,6 +176,23 @@ def send_message(to, body):
     return resp
 
 
+def send_template(to, template_name="hello_world", language_code="en_US"):
+    url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language_code}
+        }
+    }
+    resp = requests.post(url, headers=headers, json=data)
+    print("DEBUG send_template status:", to, resp.status_code, resp.text, flush=True)
+    return resp.status_code, resp.text
+
+
 def send_list(to, text, button_text, rows):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
@@ -319,7 +336,7 @@ button{padding:10px 20px;background:#2e7d32;color:#fff;border:none;cursor:pointe
 </form></body></html>
 """
 
-NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_logout') }}">Logout</a></p>"""
+NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_broadcast') }}">Broadcast</a> | <a href="{{ url_for('admin_logout') }}">Logout</a></p>"""
 
 ADMIN_HTML = """
 <!doctype html><html><head><title>Menu Admin</title>
@@ -405,6 +422,47 @@ a{display:inline-block;margin-top:10px}
 </body></html>
 """
 
+BROADCAST_HTML = """
+<!doctype html><html><head><title>Broadcast</title>
+<style>
+body{font-family:sans-serif;max-width:800px;margin:30px auto;padding:0 20px}
+textarea,input{width:100%;padding:8px;margin:6px 0;box-sizing:border-box}
+.save{background:#2e7d32;color:#fff;border:none;padding:10px 20px;cursor:pointer}
+a{color:#1565c0}
+.note{background:#fff3cd;padding:12px;border-radius:6px;margin-bottom:20px;font-size:14px}
+.results{background:#f5f5f5;padding:12px;border-radius:6px;margin-top:20px;font-family:monospace;font-size:13px;white-space:pre-wrap}
+</style></head><body>
+<h2>MUSHBOT Broadcast</h2>
+{{ nav|safe }}
+
+<div class="note">
+Broadcasting to people who have NOT messaged you recently requires an approved
+WhatsApp <b>template</b>. "hello_world" is a free sample template every WhatsApp
+Business account gets automatically — use it to test broadcasting right now.
+For real marketing content, submit a custom template in Meta Business Manager
+for approval, then enter its exact name below.
+</div>
+
+<form method="post">
+<label>Phone numbers (comma-separated, with country code, no + or spaces — e.g. 919876543210,919123456780)</label>
+<textarea name="numbers" rows="4" required></textarea>
+
+<label>Template name</label>
+<input type="text" name="template_name" value="hello_world" required>
+
+<label>Template language code</label>
+<input type="text" name="language_code" value="en_US" required>
+
+<button class="save" type="submit">Send Broadcast</button>
+</form>
+
+{% if results %}
+<div class="results">{{ results }}</div>
+{% endif %}
+
+</body></html>
+"""
+
 CUSTOMERS_HTML = """
 <!doctype html><html><head><title>Customers</title>
 <style>
@@ -460,6 +518,25 @@ def admin_panel():
     cursor.close()
     conn.close()
     return render_template_string(ADMIN_HTML, items=items, nav=render_template_string(NAV_HTML))
+
+
+@app.route('/admin/broadcast', methods=['GET', 'POST'])
+@login_required
+def admin_broadcast():
+    results = None
+    if request.method == 'POST':
+        raw_numbers = request.form.get('numbers', '')
+        template_name = request.form.get('template_name', 'hello_world').strip()
+        language_code = request.form.get('language_code', 'en_US').strip()
+
+        numbers = [n.strip() for n in raw_numbers.split(',') if n.strip()]
+        lines = []
+        for number in numbers:
+            status, body = send_template(number, template_name, language_code)
+            lines.append(f"{number} -> HTTP {status}: {body[:200]}")
+        results = "\n".join(lines)
+
+    return render_template_string(BROADCAST_HTML, nav=render_template_string(NAV_HTML), results=results)
 
 
 @app.route('/admin/customers')
