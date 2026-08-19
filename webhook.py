@@ -66,6 +66,8 @@ def init_db():
     conn.commit()
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS image_url TEXT")
     conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS collects_registration BOOLEAN DEFAULT FALSE")
+    conn.commit()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS customers (
         id SERIAL PRIMARY KEY,
@@ -81,6 +83,35 @@ def init_db():
     conn.commit()
     # In case the table already existed from before this update, add the column if missing
     cursor.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS email TEXT")
+    conn.commit()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS training_flow_state (
+        phone TEXT PRIMARY KEY,
+        training_key TEXT NOT NULL,
+        step TEXT NOT NULL,
+        name TEXT,
+        phone_number TEXT,
+        address TEXT,
+        email TEXT,
+        updated_at TIMESTAMP DEFAULT NOW()
+    )
+    """)
+    conn.commit()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS training_registrations (
+        id SERIAL PRIMARY KEY,
+        training_key TEXT NOT NULL,
+        training_title TEXT,
+        customer_phone TEXT NOT NULL,
+        name TEXT,
+        phone_number TEXT,
+        address TEXT,
+        email TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+    """)
     conn.commit()
 
     cursor.execute("SELECT COUNT(*) FROM menu_items")
@@ -136,6 +167,72 @@ def update_customer(phone, **fields):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(f"UPDATE customers SET {set_clause} WHERE phone = %s", values)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def get_training_flow(phone):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM training_flow_state WHERE phone = %s", (phone,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row
+
+
+def start_training_flow(phone, training_key):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO training_flow_state (phone, training_key, step)
+        VALUES (%s, %s, 'awaiting_name')
+        ON CONFLICT (phone) DO UPDATE SET
+            training_key = EXCLUDED.training_key, step = 'awaiting_name',
+            name = NULL, phone_number = NULL, address = NULL, email = NULL, updated_at = NOW()
+    """, (phone, training_key))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def update_training_flow(phone, **fields):
+    if not fields:
+        return
+    fields["updated_at"] = datetime.now()
+    set_clause = ", ".join(f"{k} = %s" for k in fields.keys())
+    values = list(fields.values()) + [phone]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE training_flow_state SET {set_clause} WHERE phone = %s", values)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def clear_training_flow(phone):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM training_flow_state WHERE phone = %s", (phone,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def save_training_registration(flow):
+    item = get_item(flow["training_key"])
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO training_registrations
+            (training_key, training_title, customer_phone, name, phone_number, address, email)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        flow["training_key"],
+        item["title"] if item else flow["training_key"],
+        flow["phone"], flow["name"], flow["phone_number"], flow["address"], flow["email"]
+    ))
     conn.commit()
     cursor.close()
     conn.close()
@@ -260,6 +357,27 @@ def send_list(to, text, button_text, rows):
     return resp
 
 
+def send_buttons(to, text, buttons):
+    """buttons: list of {'id': ..., 'title': ...}, max 3"""
+    url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": text},
+            "action": {"buttons": [
+                {"type": "reply", "reply": {"id": b["id"], "title": b["title"][:20]}} for b in buttons
+            ]}
+        }
+    }
+    resp = requests.post(url, headers=headers, json=data)
+    print("DEBUG send_buttons status:", resp.status_code, resp.text, flush=True)
+    return resp
+
+
 def send_menu(sender, parent_key, header):
     items = get_children(parent_key)
     if not items:
@@ -337,6 +455,60 @@ def webhook():
             send_main_menu(sender, "Main Menu:")
             return jsonify({"status": "received"}), 200
 
+        flow = get_training_flow(sender)
+        if flow:
+            if text_lower == "cancel":
+                clear_training_flow(sender)
+                send_message(sender, "Training registration cancelled.")
+                send_main_menu(sender)
+                return jsonify({"status": "received"}), 200
+
+            fstep = flow["step"]
+            if fstep == "awaiting_name":
+                update_training_flow(sender, name=text, step="awaiting_phone")
+                send_message(sender, "Thanks! Please share your contact phone number:")
+                return jsonify({"status": "received"}), 200
+
+            if fstep == "awaiting_phone":
+                update_training_flow(sender, phone_number=text, step="awaiting_address")
+                send_message(sender, "Got it. Please share your address:")
+                return jsonify({"status": "received"}), 200
+
+            if fstep == "awaiting_address":
+                update_training_flow(sender, address=text, step="awaiting_email")
+                send_message(sender, "Please share your email address, or type 'skip':")
+                return jsonify({"status": "received"}), 200
+
+            if fstep == "awaiting_email":
+                email_value = None if text_lower in ["skip", "no", "none", "-"] else text
+                update_training_flow(sender, email=email_value, step="awaiting_confirm")
+                flow = get_training_flow(sender)
+                titem = get_item(flow["training_key"])
+                summary = (
+                    f"Please confirm your registration for {titem['title'] if titem else flow['training_key']}:\n\n"
+                    f"Name: {flow['name']}\nPhone: {flow['phone_number']}\n"
+                    f"Address: {flow['address']}\nEmail: {flow['email'] or 'N/A'}"
+                )
+                send_buttons(sender, summary, [
+                    {"id": "training_confirm", "title": "Join Training"},
+                    {"id": "training_cancel", "title": "Cancel"}
+                ])
+                return jsonify({"status": "received"}), 200
+
+            if fstep == "awaiting_confirm":
+                if text_lower == "training_confirm":
+                    save_training_registration(flow)
+                    clear_training_flow(sender)
+                    send_message(sender, "You're registered! We'll contact you with training details soon.")
+                    send_main_menu(sender)
+                elif text_lower == "training_cancel":
+                    clear_training_flow(sender)
+                    send_message(sender, "Registration cancelled.")
+                    send_main_menu(sender)
+                else:
+                    send_message(sender, "Please tap 'Join Training' or 'Cancel' above.")
+                return jsonify({"status": "received"}), 200
+
         if text_lower in ["hi", "hello", "start"]:
             name = customer["name"] or ""
             send_main_menu(sender, f"Welcome back, {name}!\nChoose an option below:")
@@ -348,6 +520,11 @@ def webhook():
                 children = get_children(item["item_key"])
                 if children:
                     send_menu(sender, item["item_key"], item["title"] + ":")
+                elif item.get("collects_registration"):
+                    if item["body_text"]:
+                        send_message(sender, item["body_text"])
+                    start_training_flow(sender, item["item_key"])
+                    send_message(sender, "Let's get you registered! Please share your full name:")
                 else:
                     if item["body_text"]:
                         if item.get("image_url"):
@@ -387,7 +564,7 @@ button{padding:10px 20px;background:#2e7d32;color:#fff;border:none;cursor:pointe
 </form></body></html>
 """
 
-NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_broadcast') }}">Broadcast</a> | <a href="{{ url_for('admin_logout') }}">Logout</a></p>"""
+NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_trainings') }}">Trainings</a> | <a href="{{ url_for('admin_broadcast') }}">Broadcast</a> | <a href="{{ url_for('admin_logout') }}">Logout</a></p>"""
 
 ADMIN_HTML = """
 <!doctype html><html><head><title>Menu Admin</title>
@@ -444,6 +621,7 @@ a{color:#1565c0}
 <input type="file" name="image" accept="image/*">
 <label>Sort Order (number, lower shows first)</label>
 <input type="number" name="sort_order" value="0">
+<label><input type="checkbox" name="collects_registration" style="width:auto"> Collects training registration (starts a name/phone/address/email sign-up flow instead of just showing text)</label>
 <button class="save" type="submit">Add Item</button>
 </form>
 </div>
@@ -473,6 +651,7 @@ a{display:inline-block;margin-top:10px}
 <label>Sort Order</label>
 <input type="number" name="sort_order" value="{{ item.sort_order }}">
 <label><input type="checkbox" name="active" {{ 'checked' if item.active else '' }} style="width:auto"> Active</label>
+<label><input type="checkbox" name="collects_registration" {{ 'checked' if item.collects_registration else '' }} style="width:auto"> Collects training registration</label>
 <button class="save" type="submit">Save Changes</button>
 </form>
 <a href="{{ url_for('admin_panel') }}">&larr; Back to list</a>
@@ -548,6 +727,35 @@ a{color:#1565c0}
 """
 
 
+TRAININGS_HTML = """
+<!doctype html><html><head><title>Training Registrations</title>
+<style>
+body{font-family:sans-serif;max-width:1100px;margin:30px auto;padding:0 20px}
+table{width:100%;border-collapse:collapse}
+th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:14px}
+th{background:#2e7d32;color:#fff}
+a{color:#1565c0}
+</style></head><body>
+<h2>MUSHBOT Training Registrations</h2>
+{{ nav|safe }}
+<table>
+<tr><th>Training</th><th>Name</th><th>Phone</th><th>Address</th><th>Email</th><th>Customer WA #</th><th>Registered</th></tr>
+{% for r in regs %}
+<tr>
+<td>{{ r.training_title }}</td>
+<td>{{ r.name or '' }}</td>
+<td>{{ r.phone_number or '' }}</td>
+<td>{{ r.address or '' }}</td>
+<td>{{ r.email or '' }}</td>
+<td>{{ r.customer_phone }}</td>
+<td>{{ r.created_at }}</td>
+</tr>
+{% endfor %}
+</table>
+</body></html>
+"""
+
+
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     error = None
@@ -608,6 +816,18 @@ def admin_customers():
     return render_template_string(CUSTOMERS_HTML, customers=customers, nav=render_template_string(NAV_HTML))
 
 
+@app.route('/admin/trainings')
+@login_required
+def admin_trainings():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM training_registrations ORDER BY created_at DESC")
+    regs = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return render_template_string(TRAININGS_HTML, regs=regs, nav=render_template_string(NAV_HTML))
+
+
 @app.route('/admin/add', methods=['POST'])
 @login_required
 def admin_add():
@@ -616,13 +836,14 @@ def admin_add():
     title = request.form.get('title', '').strip()
     body_text = request.form.get('body_text', '').strip() or None
     sort_order = int(request.form.get('sort_order', 0) or 0)
+    collects_registration = True if request.form.get('collects_registration') else False
     image_url = upload_image_to_supabase(request.files.get('image'))
 
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order) VALUES (%s,%s,%s,%s,%s,%s)",
-        (item_key, parent_key, title, body_text, image_url, sort_order)
+        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration)
     )
     conn.commit()
     cursor.close()
@@ -642,17 +863,18 @@ def admin_edit(item_id):
         body_text = request.form.get('body_text', '').strip() or None
         sort_order = int(request.form.get('sort_order', 0) or 0)
         active = True if request.form.get('active') else False
+        collects_registration = True if request.form.get('collects_registration') else False
 
         new_image_url = upload_image_to_supabase(request.files.get('image'))
         if new_image_url:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, new_image_url, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, item_id)
             )
         else:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, collects_registration, item_id)
             )
         conn.commit()
         cursor.close()
