@@ -15,6 +15,11 @@ PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
+# Supabase Storage (for menu item images) — project URL and service role key
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")          # e.g. https://mxqcsdrrjflhzbeedxkx.supabase.co
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "menu-images")
+
 # Supabase Postgres connection settings (Session Pooler - IPv4 compatible)
 DB_HOST = os.environ.get("DB_HOST")
 DB_PORT = os.environ.get("DB_PORT", "5432")
@@ -53,10 +58,14 @@ def init_db():
         parent_key TEXT NOT NULL DEFAULT 'main',
         title TEXT NOT NULL,
         body_text TEXT,
+        image_url TEXT,
         sort_order INTEGER DEFAULT 0,
         active BOOLEAN DEFAULT TRUE
     )
     """)
+    conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS image_url TEXT")
+    conn.commit()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS customers (
         id SERIAL PRIMARY KEY,
@@ -165,6 +174,43 @@ def log_submission(sender, message):
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def upload_image_to_supabase(file_storage):
+    """Uploads a Flask FileStorage object to Supabase Storage and returns its public URL, or None on failure."""
+    if not file_storage or not file_storage.filename:
+        return None
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("DEBUG: Supabase Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)", flush=True)
+        return None
+
+    import time
+    safe_name = "".join(c for c in file_storage.filename if c.isalnum() or c in "._-")
+    path = f"{int(time.time())}_{safe_name}"
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": file_storage.mimetype or "application/octet-stream",
+    }
+    resp = requests.put(upload_url, headers=headers, data=file_storage.read())
+    print("DEBUG image upload status:", resp.status_code, resp.text[:300], flush=True)
+    if resp.status_code in (200, 201):
+        return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
+    return None
+
+
+def send_image(to, image_url, caption=None):
+    url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    image_obj = {"link": image_url}
+    if caption:
+        image_obj["caption"] = caption
+    data = {"messaging_product": "whatsapp", "to": to, "type": "image", "image": image_obj}
+    resp = requests.post(url, headers=headers, json=data)
+    print("DEBUG send_image status:", resp.status_code, resp.text, flush=True)
+    return resp
 
 
 def send_message(to, body):
@@ -304,7 +350,12 @@ def webhook():
                     send_menu(sender, item["item_key"], item["title"] + ":")
                 else:
                     if item["body_text"]:
-                        send_message(sender, item["body_text"])
+                        if item.get("image_url"):
+                            send_image(sender, item["image_url"], caption=item["body_text"])
+                        else:
+                            send_message(sender, item["body_text"])
+                    elif item.get("image_url"):
+                        send_image(sender, item["image_url"])
                     if item["item_key"] == "thanks":
                         log_submission(sender, "thanks")
             else:
@@ -358,9 +409,10 @@ a{color:#1565c0}
 {{ nav|safe }}
 
 <table>
-<tr><th>Key</th><th>Parent</th><th>Title</th><th>Body Text</th><th>Order</th><th>Active</th><th>Actions</th></tr>
+<tr><th>Image</th><th>Key</th><th>Parent</th><th>Title</th><th>Body Text</th><th>Order</th><th>Active</th><th>Actions</th></tr>
 {% for item in items %}
 <tr>
+<td>{% if item.image_url %}<img src="{{ item.image_url }}" style="width:50px;height:50px;object-fit:cover;border-radius:4px">{% endif %}</td>
 <td>{{ item.item_key }}</td>
 <td>{{ item.parent_key }}</td>
 <td>{{ item.title }}</td>
@@ -379,7 +431,7 @@ a{color:#1565c0}
 
 <div class="addbox">
 <h3>Add New Menu Item</h3>
-<form method="post" action="{{ url_for('admin_add') }}">
+<form method="post" action="{{ url_for('admin_add') }}" enctype="multipart/form-data">
 <label>Item Key (unique, lowercase, no spaces)</label>
 <input type="text" name="item_key" required>
 <label>Parent Key (use "main" for top-level, or another item's key for a submenu)</label>
@@ -388,6 +440,8 @@ a{color:#1565c0}
 <input type="text" name="title" required>
 <label>Body Text (message sent when selected -- leave blank if this item has its own submenu)</label>
 <textarea name="body_text" rows="3"></textarea>
+<label>Picture (optional -- sent along with the body text when this item is selected)</label>
+<input type="file" name="image" accept="image/*">
 <label>Sort Order (number, lower shows first)</label>
 <input type="number" name="sort_order" value="0">
 <button class="save" type="submit">Add Item</button>
@@ -406,13 +460,16 @@ input,select,textarea{width:100%;padding:8px;margin:6px 0;box-sizing:border-box}
 a{display:inline-block;margin-top:10px}
 </style></head><body>
 <h2>Edit: {{ item.item_key }}</h2>
-<form method="post">
+{% if item.image_url %}<img src="{{ item.image_url }}" style="width:120px;height:120px;object-fit:cover;border-radius:6px;display:block;margin-bottom:10px">{% endif %}
+<form method="post" enctype="multipart/form-data">
 <label>Parent Key</label>
 <input type="text" name="parent_key" value="{{ item.parent_key }}" required>
 <label>Title</label>
 <input type="text" name="title" value="{{ item.title }}" required>
 <label>Body Text</label>
 <textarea name="body_text" rows="4">{{ item.body_text or '' }}</textarea>
+<label>Picture (upload a new one to replace the current image)</label>
+<input type="file" name="image" accept="image/*">
 <label>Sort Order</label>
 <input type="number" name="sort_order" value="{{ item.sort_order }}">
 <label><input type="checkbox" name="active" {{ 'checked' if item.active else '' }} style="width:auto"> Active</label>
@@ -559,12 +616,13 @@ def admin_add():
     title = request.form.get('title', '').strip()
     body_text = request.form.get('body_text', '').strip() or None
     sort_order = int(request.form.get('sort_order', 0) or 0)
+    image_url = upload_image_to_supabase(request.files.get('image'))
 
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO menu_items (item_key, parent_key, title, body_text, sort_order) VALUES (%s,%s,%s,%s,%s)",
-        (item_key, parent_key, title, body_text, sort_order)
+        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order) VALUES (%s,%s,%s,%s,%s,%s)",
+        (item_key, parent_key, title, body_text, image_url, sort_order)
     )
     conn.commit()
     cursor.close()
@@ -585,10 +643,17 @@ def admin_edit(item_id):
         sort_order = int(request.form.get('sort_order', 0) or 0)
         active = True if request.form.get('active') else False
 
-        cursor.execute(
-            "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s WHERE id=%s",
-            (parent_key, title, body_text, sort_order, active, item_id)
-        )
+        new_image_url = upload_image_to_supabase(request.files.get('image'))
+        if new_image_url:
+            cursor.execute(
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, new_image_url, item_id)
+            )
+        else:
+            cursor.execute(
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, item_id)
+            )
         conn.commit()
         cursor.close()
         conn.close()
