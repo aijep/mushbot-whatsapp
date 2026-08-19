@@ -63,11 +63,15 @@ def init_db():
         phone TEXT UNIQUE NOT NULL,
         name TEXT,
         address TEXT,
+        email TEXT,
         stage TEXT DEFAULT 'new',
         created_at TIMESTAMP DEFAULT NOW(),
         completed_at TIMESTAMP
     )
     """)
+    conn.commit()
+    # In case the table already existed from before this update, add the column if missing
+    cursor.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS email TEXT")
     conn.commit()
 
     cursor.execute("SELECT COUNT(*) FROM menu_items")
@@ -259,7 +263,13 @@ def webhook():
             return jsonify({"status": "received"}), 200
 
         if stage == "awaiting_address":
-            update_customer(sender, address=text, stage="completed", completed_at=datetime.now())
+            update_customer(sender, address=text, stage="awaiting_email")
+            send_message(sender, "Got it! Lastly, share your email address (optional) — or type 'skip' to continue without one:")
+            return jsonify({"status": "received"}), 200
+
+        if stage == "awaiting_email":
+            email_value = None if text_lower in ["skip", "no", "none", "-"] else text
+            update_customer(sender, email=email_value, stage="completed", completed_at=datetime.now())
             send_message(sender, "Thanks! Your details have been saved.")
             send_main_menu(sender, "Main Menu:")
             return jsonify({"status": "received"}), 200
@@ -407,12 +417,13 @@ a{color:#1565c0}
 <h2>MUSHBOT Customers</h2>
 {{ nav|safe }}
 <table>
-<tr><th>Phone</th><th>Name</th><th>Address</th><th>Stage</th><th>Joined</th></tr>
+<tr><th>Phone</th><th>Name</th><th>Address</th><th>Email</th><th>Stage</th><th>Joined</th></tr>
 {% for c in customers %}
 <tr>
 <td>{{ c.phone }}</td>
 <td>{{ c.name or '' }}</td>
 <td>{{ c.address or '' }}</td>
+<td>{{ c.email or '' }}</td>
 <td>{{ c.stage }}</td>
 <td>{{ c.created_at }}</td>
 </tr>
