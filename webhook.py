@@ -9,13 +9,13 @@ from datetime import datetime
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key")
 
-# ✅ Secrets loaded from Render's Environment Variables
+# Secrets loaded from Render's Environment Variables
 ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
-# ✅ Supabase Postgres connection settings (Session Pooler — IPv4 compatible)
+# Supabase Postgres connection settings (Session Pooler - IPv4 compatible)
 DB_HOST = os.environ.get("DB_HOST")
 DB_PORT = os.environ.get("DB_PORT", "5432")
 DB_NAME = os.environ.get("DB_NAME", "postgres")
@@ -57,20 +57,31 @@ def init_db():
         active BOOLEAN DEFAULT TRUE
     )
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS customers (
+        id SERIAL PRIMARY KEY,
+        phone TEXT UNIQUE NOT NULL,
+        name TEXT,
+        address TEXT,
+        stage TEXT DEFAULT 'new',
+        created_at TIMESTAMP DEFAULT NOW(),
+        completed_at TIMESTAMP
+    )
+    """)
     conn.commit()
 
     cursor.execute("SELECT COUNT(*) FROM menu_items")
     count = cursor.fetchone()[0]
     if count == 0:
         seed_rows = [
-            ("products",  "main",     "🍄 Products",  None, 1),
-            ("farms",     "main",     "🏡 Farms",     "🏡 Visit our Mushroom Farms for hands-on cultivation experience.\n\nType 'menu' to return.", 2),
-            ("trainings", "main",     "🎓 Trainings", "🎓 Join our Mushroom Trainings to become a certified cultivator.\n\nType 'menu' to return.", 3),
-            ("support",   "main",     "📞 Support",   "📞 Contact Support: +91-9876543210\n\nType 'menu' to return.", 4),
-            ("thanks",    "main",     "✅ Finish",    "✅ Thank you! All your info has been submitted.", 5),
-            ("oyster",    "products", "🌿 Oyster",    "🌿 Oyster Mushroom: Rich in protein, easy to cultivate, popular in gourmet dishes.\n\nType 'menu' to return.", 1),
-            ("button",    "products", "🍄 Button",    "🍄 Button Mushroom: Commonly used in curries and pizzas, widely cultivated worldwide.\n\nType 'menu' to return.", 2),
-            ("shiitake",  "products", "🌿 Shiitake",  "🌿 Shiitake Mushroom: Known for medicinal properties and strong umami flavor.\n\nType 'menu' to return.", 3),
+            ("products",  "main",     "Products",  None, 1),
+            ("farms",     "main",     "Farms",     "Visit our Mushroom Farms for hands-on cultivation experience.\n\nType 'menu' to return.", 2),
+            ("trainings", "main",     "Trainings", "Join our Mushroom Trainings to become a certified cultivator.\n\nType 'menu' to return.", 3),
+            ("support",   "main",     "Support",   "Contact Support: +91-9876543210\n\nType 'menu' to return.", 4),
+            ("thanks",    "main",     "Finish",    "Thank you! All your info has been submitted.", 5),
+            ("oyster",    "products", "Oyster",    "Oyster Mushroom: Rich in protein, easy to cultivate, popular in gourmet dishes.\n\nType 'menu' to return.", 1),
+            ("button",    "products", "Button",    "Button Mushroom: Commonly used in curries and pizzas, widely cultivated worldwide.\n\nType 'menu' to return.", 2),
+            ("shiitake",  "products", "Shiitake",  "Shiitake Mushroom: Known for medicinal properties and strong umami flavor.\n\nType 'menu' to return.", 3),
         ]
         cursor.executemany(
             "INSERT INTO menu_items (item_key, parent_key, title, body_text, sort_order) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (item_key) DO NOTHING",
@@ -78,6 +89,41 @@ def init_db():
         )
         conn.commit()
 
+    cursor.close()
+    conn.close()
+
+
+def get_customer(phone):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM customers WHERE phone = %s", (phone,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row
+
+
+def create_customer(phone):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO customers (phone, stage) VALUES (%s, 'awaiting_name') ON CONFLICT (phone) DO NOTHING",
+        (phone,)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def update_customer(phone, **fields):
+    if not fields:
+        return
+    set_clause = ", ".join(f"{k} = %s" for k in fields.keys())
+    values = list(fields.values()) + [phone]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE customers SET {set_clause} WHERE phone = %s", values)
+    conn.commit()
     cursor.close()
     conn.close()
 
@@ -156,7 +202,7 @@ def send_menu(sender, parent_key, header):
     send_list(sender, header, "Choose", rows)
 
 
-def send_main_menu(sender, header="🌿 Main Menu:"):
+def send_main_menu(sender, header="Main Menu:"):
     send_menu(sender, "main", header)
 
 
@@ -190,20 +236,41 @@ def webhook():
         if "interactive" in message:
             interactive = message["interactive"]
             if "button_reply" in interactive:
-                text = interactive["button_reply"]["id"].strip().lower()
+                text = interactive["button_reply"]["id"].strip()
             elif "list_reply" in interactive:
-                text = interactive["list_reply"]["id"].strip().lower()
+                text = interactive["list_reply"]["id"].strip()
         elif "text" in message:
-            text = message["text"]["body"].strip().lower()
+            text = message["text"]["body"].strip()
 
-        print("DEBUG normalized text:", text, flush=True)
+        text_lower = text.lower()
+        print("DEBUG normalized text:", text_lower, flush=True)
 
-        if text in ["hi", "hello", "start"]:
-            send_main_menu(sender, "👋 Welcome to MUSHBOT!\nChoose an option below:")
-        elif text == "menu":
+        customer = get_customer(sender)
+        if not customer:
+            create_customer(sender)
+            send_message(sender, "Welcome to MUSHBOT!\nBefore we start, please tell us your name:")
+            return jsonify({"status": "received"}), 200
+
+        stage = customer["stage"]
+
+        if stage == "awaiting_name":
+            update_customer(sender, name=text, stage="awaiting_address")
+            send_message(sender, f"Thanks {text}! Now please share your delivery address:")
+            return jsonify({"status": "received"}), 200
+
+        if stage == "awaiting_address":
+            update_customer(sender, address=text, stage="completed", completed_at=datetime.now())
+            send_message(sender, "Thanks! Your details have been saved.")
+            send_main_menu(sender, "Main Menu:")
+            return jsonify({"status": "received"}), 200
+
+        if text_lower in ["hi", "hello", "start"]:
+            name = customer["name"] or ""
+            send_main_menu(sender, f"Welcome back, {name}!\nChoose an option below:")
+        elif text_lower == "menu":
             send_main_menu(sender)
         else:
-            item = get_item(text)
+            item = get_item(text_lower)
             if item:
                 children = get_children(item["item_key"])
                 if children:
@@ -218,8 +285,6 @@ def webhook():
 
         return jsonify({"status": "received"}), 200
 
-
-# ---------------- Admin Panel ----------------
 
 def login_required(f):
     @wraps(f)
@@ -236,7 +301,7 @@ LOGIN_HTML = """
 input{width:100%;padding:10px;margin:8px 0;box-sizing:border-box}
 button{padding:10px 20px;background:#2e7d32;color:#fff;border:none;cursor:pointer}
 .error{color:red}</style></head><body>
-<h2>🍄 MUSHBOT Admin Login</h2>
+<h2>MUSHBOT Admin Login</h2>
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 <form method="post">
 <input type="password" name="password" placeholder="Admin password" required>
@@ -244,10 +309,12 @@ button{padding:10px 20px;background:#2e7d32;color:#fff;border:none;cursor:pointe
 </form></body></html>
 """
 
+NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_logout') }}">Logout</a></p>"""
+
 ADMIN_HTML = """
 <!doctype html><html><head><title>Menu Admin</title>
 <style>
-body{font-family:sans-serif;max-width:900px;margin:30px auto;padding:0 20px}
+body{font-family:sans-serif;max-width:1000px;margin:30px auto;padding:0 20px}
 table{width:100%;border-collapse:collapse;margin-bottom:30px}
 th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:14px}
 th{background:#2e7d32;color:#fff}
@@ -258,9 +325,10 @@ button{padding:6px 12px;cursor:pointer}
 .addbox{background:#f5f5f5;padding:20px;border-radius:8px}
 input,select,textarea{width:100%;padding:8px;margin:6px 0;box-sizing:border-box}
 .save{background:#2e7d32;color:#fff;border:none;padding:10px 20px;cursor:pointer}
-.logout{float:right}
+a{color:#1565c0}
 </style></head><body>
-<h2>🍄 MUSHBOT Menu Admin <a class="logout" href="{{ url_for('admin_logout') }}">Logout</a></h2>
+<h2>MUSHBOT Menu Admin</h2>
+{{ nav|safe }}
 
 <table>
 <tr><th>Key</th><th>Parent</th><th>Title</th><th>Body Text</th><th>Order</th><th>Active</th><th>Actions</th></tr>
@@ -291,7 +359,7 @@ input,select,textarea{width:100%;padding:8px;margin:6px 0;box-sizing:border-box}
 <input type="text" name="parent_key" value="main" required>
 <label>Title (button label shown in WhatsApp, keep short)</label>
 <input type="text" name="title" required>
-<label>Body Text (message sent when selected — leave blank if this item has its own submenu)</label>
+<label>Body Text (message sent when selected -- leave blank if this item has its own submenu)</label>
 <textarea name="body_text" rows="3"></textarea>
 <label>Sort Order (number, lower shows first)</label>
 <input type="number" name="sort_order" value="0">
@@ -327,6 +395,32 @@ a{display:inline-block;margin-top:10px}
 </body></html>
 """
 
+CUSTOMERS_HTML = """
+<!doctype html><html><head><title>Customers</title>
+<style>
+body{font-family:sans-serif;max-width:1000px;margin:30px auto;padding:0 20px}
+table{width:100%;border-collapse:collapse}
+th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:14px}
+th{background:#2e7d32;color:#fff}
+a{color:#1565c0}
+</style></head><body>
+<h2>MUSHBOT Customers</h2>
+{{ nav|safe }}
+<table>
+<tr><th>Phone</th><th>Name</th><th>Address</th><th>Stage</th><th>Joined</th></tr>
+{% for c in customers %}
+<tr>
+<td>{{ c.phone }}</td>
+<td>{{ c.name or '' }}</td>
+<td>{{ c.address or '' }}</td>
+<td>{{ c.stage }}</td>
+<td>{{ c.created_at }}</td>
+</tr>
+{% endfor %}
+</table>
+</body></html>
+"""
+
 
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
@@ -354,7 +448,19 @@ def admin_panel():
     items = cursor.fetchall()
     cursor.close()
     conn.close()
-    return render_template_string(ADMIN_HTML, items=items)
+    return render_template_string(ADMIN_HTML, items=items, nav=render_template_string(NAV_HTML))
+
+
+@app.route('/admin/customers')
+@login_required
+def admin_customers():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM customers ORDER BY created_at DESC")
+    customers = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return render_template_string(CUSTOMERS_HTML, customers=customers, nav=render_template_string(NAV_HTML))
 
 
 @app.route('/admin/add', methods=['POST'])
@@ -418,8 +524,6 @@ def admin_delete(item_id):
     conn.close()
     return redirect(url_for('admin_panel'))
 
-
-# ---------------- Utility routes ----------------
 
 @app.route('/')
 def home():
