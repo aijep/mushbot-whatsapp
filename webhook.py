@@ -153,7 +153,7 @@ def webhook():
 
         # ✅ Submenu: Products
         elif text == "products":
-            send_list(sender, "🍄 123 Mushroom Products:", "Choose", [
+            send_list(sender, "🍄 Mushroom Products:", "Choose", [
                 {"id": "oyster", "title": "🌿 Oyster"},
                 {"id": "button", "title": "🍄 Button"},
                 {"id": "shiitake", "title": "🌿 Shiitake"},
