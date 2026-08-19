@@ -15,6 +15,14 @@ PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
+# Email (SMTP) settings for training confirmation emails
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
+EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "Mushroom Training Center")
+
 # Supabase Storage (for menu item images) — project URL and service role key
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")          # e.g. https://mxqcsdrrjflhzbeedxkx.supabase.co
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -67,6 +75,10 @@ def init_db():
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS image_url TEXT")
     conn.commit()
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS collects_registration BOOLEAN DEFAULT FALSE")
+    conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS training_time TEXT")
+    conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS training_venue TEXT")
     conn.commit()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS customers (
@@ -298,6 +310,52 @@ def upload_image_to_supabase(file_storage):
     return None
 
 
+def send_training_email(to_email, customer_name, training_title, training_time, training_venue):
+    """Sends a training confirmation email via SMTP. Returns (success: bool, error: str|None)."""
+    if not to_email:
+        return False, "No email address provided"
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print("DEBUG: SMTP not configured (missing SMTP_USER/SMTP_PASSWORD)", flush=True)
+        return False, "SMTP not configured"
+
+    import smtplib
+    from email.mime.text import MIMEText
+
+    time_line = training_time or "To be announced"
+    venue_line = training_venue or "To be announced"
+
+    body = f"""Dear {customer_name or 'Trainee'},
+
+Greetings from Mushroom Training Center!
+
+You have successfully registered for: {training_title}
+
+Training Time: {time_line}
+Venue: {venue_line}
+
+We look forward to seeing you there. If you have any questions before the session, feel free to reply to this email.
+
+Regards,
+Mushroom Training Center
+"""
+
+    msg = MIMEText(body)
+    msg["Subject"] = f"Registration Confirmed: {training_title}"
+    msg["From"] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>"
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [to_email], msg.as_string())
+        print("DEBUG: training email sent to", to_email, flush=True)
+        return True, None
+    except Exception as e:
+        print("DEBUG: training email FAILED:", repr(e), flush=True)
+        return False, str(e)
+
+
 def send_image(to, image_url, caption=None):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
@@ -498,8 +556,18 @@ def webhook():
             if fstep == "awaiting_confirm":
                 if text_lower == "training_confirm":
                     save_training_registration(flow)
+                    titem = get_item(flow["training_key"])
+                    training_title = titem["title"] if titem else flow["training_key"]
                     clear_training_flow(sender)
                     send_message(sender, "You're registered! We'll contact you with training details soon.")
+                    if flow.get("email"):
+                        sent, err = send_training_email(
+                            flow["email"], flow["name"], training_title,
+                            titem.get("training_time") if titem else None,
+                            titem.get("training_venue") if titem else None
+                        )
+                        if not sent:
+                            print("DEBUG: could not send training confirmation email:", err, flush=True)
                     send_main_menu(sender)
                 elif text_lower == "training_cancel":
                     clear_training_flow(sender)
@@ -622,6 +690,10 @@ a{color:#1565c0}
 <label>Sort Order (number, lower shows first)</label>
 <input type="number" name="sort_order" value="0">
 <label><input type="checkbox" name="collects_registration" style="width:auto"> Collects training registration (starts a name/phone/address/email sign-up flow instead of just showing text)</label>
+<label>Training Time (only used if the checkbox above is ticked -- e.g. "Every Saturday, 10:00 AM")</label>
+<input type="text" name="training_time">
+<label>Training Venue (only used if the checkbox above is ticked)</label>
+<input type="text" name="training_venue">
 <button class="save" type="submit">Add Item</button>
 </form>
 </div>
@@ -652,6 +724,10 @@ a{display:inline-block;margin-top:10px}
 <input type="number" name="sort_order" value="{{ item.sort_order }}">
 <label><input type="checkbox" name="active" {{ 'checked' if item.active else '' }} style="width:auto"> Active</label>
 <label><input type="checkbox" name="collects_registration" {{ 'checked' if item.collects_registration else '' }} style="width:auto"> Collects training registration</label>
+<label>Training Time (only used if the checkbox above is ticked)</label>
+<input type="text" name="training_time" value="{{ item.training_time or '' }}">
+<label>Training Venue (only used if the checkbox above is ticked)</label>
+<input type="text" name="training_venue" value="{{ item.training_venue or '' }}">
 <button class="save" type="submit">Save Changes</button>
 </form>
 <a href="{{ url_for('admin_panel') }}">&larr; Back to list</a>
@@ -837,13 +913,15 @@ def admin_add():
     body_text = request.form.get('body_text', '').strip() or None
     sort_order = int(request.form.get('sort_order', 0) or 0)
     collects_registration = True if request.form.get('collects_registration') else False
+    training_time = request.form.get('training_time', '').strip() or None
+    training_venue = request.form.get('training_venue', '').strip() or None
     image_url = upload_image_to_supabase(request.files.get('image'))
 
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration)
+        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue)
     )
     conn.commit()
     cursor.close()
@@ -864,17 +942,19 @@ def admin_edit(item_id):
         sort_order = int(request.form.get('sort_order', 0) or 0)
         active = True if request.form.get('active') else False
         collects_registration = True if request.form.get('collects_registration') else False
+        training_time = request.form.get('training_time', '').strip() or None
+        training_venue = request.form.get('training_venue', '').strip() or None
 
         new_image_url = upload_image_to_supabase(request.files.get('image'))
         if new_image_url:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_venue=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_venue, item_id)
             )
         else:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, collects_registration, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_venue=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_venue, item_id)
             )
         conn.commit()
         cursor.close()
