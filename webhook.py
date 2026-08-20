@@ -28,6 +28,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")          # e.g. https://mxqcsd
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "menu-images")
 
+# WhatsApp Commerce Catalog settings
+WHATSAPP_CATALOG_ID = os.environ.get("WHATSAPP_CATALOG_ID", "")  # set this once the catalog is created
+CATALOG_THUMBNAIL_PRODUCT_ID = os.environ.get("CATALOG_THUMBNAIL_PRODUCT_ID", "")  # optional, a product SKU to use as the preview image
+
 # Supabase Postgres connection settings (Session Pooler - IPv4 compatible)
 DB_HOST = os.environ.get("DB_HOST")
 DB_PORT = os.environ.get("DB_PORT", "5432")
@@ -79,6 +83,8 @@ def init_db():
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS training_time TEXT")
     conn.commit()
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS training_venue TEXT")
+    conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS opens_catalog BOOLEAN DEFAULT FALSE")
     conn.commit()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS customers (
@@ -400,6 +406,34 @@ Mushroom Training Center
         return False, str(e)
 
 
+def send_catalog_message(to, body_text):
+    """Sends a free-form message with a 'View Catalog' button that opens the full WhatsApp Commerce Catalog."""
+    if not WHATSAPP_CATALOG_ID:
+        send_message(to, "Our product catalog isn't set up yet. Please check back soon, or type 'menu' to explore other options.")
+        print("DEBUG: send_catalog_message called but WHATSAPP_CATALOG_ID is not set", flush=True)
+        return None
+
+    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    action = {"name": "catalog_message", "parameters": {}}
+    if CATALOG_THUMBNAIL_PRODUCT_ID:
+        action["parameters"]["thumbnail_product_retailer_id"] = CATALOG_THUMBNAIL_PRODUCT_ID
+
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "catalog_message",
+            "body": {"text": body_text},
+            "action": action
+        }
+    }
+    resp = requests.post(url, headers=headers, json=data)
+    print("DEBUG send_catalog_message status:", resp.status_code, resp.text, flush=True)
+    return resp
+
+
 def send_image(to, image_url, caption=None):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
@@ -643,7 +677,10 @@ def webhook():
             item = get_item(text_lower)
             if item:
                 children = get_children(item["item_key"])
-                if children:
+                if item.get("opens_catalog"):
+                    body_text = item["body_text"] or "Browse our full range of fresh mushrooms and mushroom products below!"
+                    send_catalog_message(sender, body_text)
+                elif children:
                     send_menu(sender, item["item_key"], item["title"] + ":")
                 elif item.get("collects_registration"):
                     if item["body_text"]:
@@ -747,7 +784,8 @@ a{color:#1565c0}
 <label>Sort Order (number, lower shows first)</label>
 <input type="number" name="sort_order" value="0">
 <label><input type="checkbox" name="collects_registration" style="width:auto"> Collects training registration (starts a name/phone/address/email sign-up flow instead of just showing text)</label>
-<label>Training Time (only used if the checkbox above is ticked -- e.g. "Every Saturday, 10:00 AM")</label>
+<label><input type="checkbox" name="opens_catalog" style="width:auto"> Opens WhatsApp Catalog (shows the full scrollable product catalog with cart/ordering instead of a submenu -- requires Catalog setup)</label>
+<label>Training Time (only used if "Collects training registration" is ticked)</label>
 <input type="text" name="training_time">
 <label>Training Venue (only used if the checkbox above is ticked)</label>
 <input type="text" name="training_venue">
@@ -781,7 +819,8 @@ a{display:inline-block;margin-top:10px}
 <input type="number" name="sort_order" value="{{ item.sort_order }}">
 <label><input type="checkbox" name="active" {{ 'checked' if item.active else '' }} style="width:auto"> Active</label>
 <label><input type="checkbox" name="collects_registration" {{ 'checked' if item.collects_registration else '' }} style="width:auto"> Collects training registration</label>
-<label>Training Time (only used if the checkbox above is ticked)</label>
+<label><input type="checkbox" name="opens_catalog" {{ 'checked' if item.opens_catalog else '' }} style="width:auto"> Opens WhatsApp Catalog (full product catalog with cart/ordering)</label>
+<label>Training Time (only used if "Collects training registration" is ticked)</label>
 <input type="text" name="training_time" value="{{ item.training_time or '' }}">
 <label>Training Venue (only used if the checkbox above is ticked)</label>
 <input type="text" name="training_venue" value="{{ item.training_venue or '' }}">
@@ -1033,6 +1072,7 @@ def admin_add():
     body_text = request.form.get('body_text', '').strip() or None
     sort_order = int(request.form.get('sort_order', 0) or 0)
     collects_registration = True if request.form.get('collects_registration') else False
+    opens_catalog = True if request.form.get('opens_catalog') else False
     training_time = request.form.get('training_time', '').strip() or None
     training_venue = request.form.get('training_venue', '').strip() or None
     image_url = upload_image_to_supabase(request.files.get('image'))
@@ -1040,8 +1080,8 @@ def admin_add():
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue)
+        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue, opens_catalog) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue, opens_catalog)
     )
     conn.commit()
     cursor.close()
@@ -1062,19 +1102,20 @@ def admin_edit(item_id):
         sort_order = int(request.form.get('sort_order', 0) or 0)
         active = True if request.form.get('active') else False
         collects_registration = True if request.form.get('collects_registration') else False
+        opens_catalog = True if request.form.get('opens_catalog') else False
         training_time = request.form.get('training_time', '').strip() or None
         training_venue = request.form.get('training_venue', '').strip() or None
 
         new_image_url = upload_image_to_supabase(request.files.get('image'))
         if new_image_url:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_venue=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_venue, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_venue=%s, opens_catalog=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_venue, opens_catalog, item_id)
             )
         else:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_venue=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_venue, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_venue=%s, opens_catalog=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_venue, opens_catalog, item_id)
             )
         conn.commit()
         cursor.close()
