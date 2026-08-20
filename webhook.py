@@ -112,6 +112,21 @@ def init_db():
     conn.commit()
 
     cursor.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        customer_phone TEXT NOT NULL,
+        catalog_id TEXT,
+        currency TEXT,
+        total_amount NUMERIC,
+        items_json TEXT,
+        order_text TEXT,
+        status TEXT DEFAULT 'new',
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+    """)
+    conn.commit()
+
+    cursor.execute("""
     CREATE TABLE IF NOT EXISTS training_registrations (
         id SERIAL PRIMARY KEY,
         training_key TEXT NOT NULL,
@@ -248,6 +263,35 @@ def save_training_registration(flow):
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def save_order(phone, order_data):
+    """order_data is the raw 'order' object from the WhatsApp webhook payload."""
+    import json
+    catalog_id = order_data.get("catalog_id")
+    order_text = order_data.get("text")
+    product_items = order_data.get("product_items", [])
+
+    total = 0
+    for p in product_items:
+        try:
+            total += float(p.get("item_price", 0)) * float(p.get("quantity", 0))
+        except (TypeError, ValueError):
+            pass
+
+    currency = product_items[0].get("currency") if product_items else None
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO orders (customer_phone, catalog_id, currency, total_amount, items_json, order_text)
+        VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
+    """, (phone, catalog_id, currency, total, json.dumps(product_items), order_text))
+    order_id = cursor.fetchone()[0]
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return order_id, product_items, total, currency
 
 
 def get_children(parent_key):
@@ -475,6 +519,19 @@ def webhook():
 
         print("DEBUG incoming message:", message, flush=True)
 
+        if "order" in message:
+            order_id, product_items, total, currency = save_order(sender, message["order"])
+            currency_label = currency or ""
+            lines = [f"Order #{order_id} received!\n"]
+            for p in product_items:
+                qty = p.get("quantity", 0)
+                price = p.get("item_price", 0)
+                lines.append(f"- {p.get('product_retailer_id')} x{qty} ({currency_label} {price} each)")
+            lines.append(f"\nTotal: {currency_label} {total:.2f}".strip())
+            lines.append("\nOur team will confirm your order and delivery details shortly. Thank you for shopping with Mushroom World!")
+            send_message(sender, "\n".join(lines))
+            return jsonify({"status": "received"}), 200
+
         text = ""
         if "interactive" in message:
             interactive = message["interactive"]
@@ -632,7 +689,7 @@ button{padding:10px 20px;background:#2e7d32;color:#fff;border:none;cursor:pointe
 </form></body></html>
 """
 
-NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_trainings') }}">Trainings</a> | <a href="{{ url_for('admin_broadcast') }}">Broadcast</a> | <a href="{{ url_for('admin_logout') }}">Logout</a></p>"""
+NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_trainings') }}">Trainings</a> | <a href="{{ url_for('admin_orders') }}">Orders</a> | <a href="{{ url_for('admin_broadcast') }}">Broadcast</a> | <a href="{{ url_for('admin_logout') }}">Logout</a></p>"""
 
 ADMIN_HTML = """
 <!doctype html><html><head><title>Menu Admin</title>
@@ -832,6 +889,44 @@ a{color:#1565c0}
 """
 
 
+ORDERS_HTML = """
+<!doctype html><html><head><title>Orders</title>
+<style>
+body{font-family:sans-serif;max-width:1100px;margin:30px auto;padding:0 20px}
+table{width:100%;border-collapse:collapse}
+th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:14px;vertical-align:top}
+th{background:#2e7d32;color:#fff}
+a{color:#1565c0}
+pre{white-space:pre-wrap;font-size:12px;margin:0}
+select{padding:4px}
+</style></head><body>
+<h2>MUSHBOT Orders</h2>
+{{ nav|safe }}
+<table>
+<tr><th>ID</th><th>Customer WA #</th><th>Items</th><th>Total</th><th>Status</th><th>Placed</th></tr>
+{% for o in orders %}
+<tr>
+<td>{{ o.id }}</td>
+<td>{{ o.customer_phone }}</td>
+<td><pre>{{ o.items_json }}</pre>{% if o.order_text %}<br><em>{{ o.order_text }}</em>{% endif %}</td>
+<td>{{ o.currency or '' }} {{ o.total_amount }}</td>
+<td>
+<form class="inline" method="post" action="{{ url_for('admin_order_status', order_id=o.id) }}">
+<select name="status" onchange="this.form.submit()">
+{% for s in ['new','confirmed','shipped','delivered','cancelled'] %}
+<option value="{{ s }}" {{ 'selected' if o.status==s else '' }}>{{ s }}</option>
+{% endfor %}
+</select>
+</form>
+</td>
+<td>{{ o.created_at }}</td>
+</tr>
+{% endfor %}
+</table>
+</body></html>
+"""
+
+
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     error = None
@@ -902,6 +997,31 @@ def admin_trainings():
     cursor.close()
     conn.close()
     return render_template_string(TRAININGS_HTML, regs=regs, nav=render_template_string(NAV_HTML))
+
+
+@app.route('/admin/orders')
+@login_required
+def admin_orders():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM orders ORDER BY created_at DESC")
+    orders = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return render_template_string(ORDERS_HTML, orders=orders, nav=render_template_string(NAV_HTML))
+
+
+@app.route('/admin/orders/<int:order_id>/status', methods=['POST'])
+@login_required
+def admin_order_status(order_id):
+    status = request.form.get('status', 'new')
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (status, order_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return redirect(url_for('admin_orders'))
 
 
 @app.route('/admin/add', methods=['POST'])
