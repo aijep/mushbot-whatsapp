@@ -1036,31 +1036,53 @@ button{padding:6px 12px;cursor:pointer}
 input,select,textarea{width:100%;padding:8px;margin:6px 0;box-sizing:border-box}
 .save{background:#2e7d32;color:#fff;border:none;padding:10px 20px;cursor:pointer}
 a{color:#1565c0}
+.breadcrumb{margin:10px 0 20px;font-size:15px}
+.breadcrumb a{color:#1565c0;text-decoration:none}
+.breadcrumb a:hover{text-decoration:underline}
+.breadcrumb .sep{color:#888;margin:0 6px}
+.breadcrumb .current{color:#333;font-weight:bold}
+.open-link{font-size:12px;color:#2e7d32;text-decoration:none;display:block;margin-top:2px}
 </style></head><body>
 <h2>MUSHBOT Menu Admin</h2>
 {{ nav|safe }}
 
+<div class="breadcrumb">
+{% for key, label in breadcrumb %}
+{% if loop.last %}
+<span class="current">{{ label }}</span>
+{% else %}
+<a href="{{ url_for('admin_panel', parent=key) }}">{{ label }}</a><span class="sep">/</span>
+{% endif %}
+{% endfor %}
+</div>
+
 <table>
-<tr><th>Image</th><th>Key</th><th>Parent</th><th>Title</th><th>Body Text</th><th>Price</th><th>Stock</th><th>Order</th><th>Active</th><th>Actions</th></tr>
+<tr><th>Image</th><th>Key</th><th>Title</th><th>Body Text</th><th>Price</th><th>Stock</th><th>Order</th><th>Active</th><th>Actions</th></tr>
 {% for item in items %}
 <tr>
 <td>{% if item.image_url %}<img src="{{ item.image_url }}" style="width:50px;height:50px;object-fit:cover;border-radius:4px">{% endif %}</td>
 <td>{{ item.item_key }}</td>
-<td>{{ item.parent_key }}</td>
-<td>{{ item.title }}</td>
+<td>{{ item.title }}
+{% if item.item_key in parent_keys_in_use %}
+<a class="open-link" href="{{ url_for('admin_panel', parent=item.item_key) }}">Open submenu &rarr;</a>
+{% endif %}
+</td>
 <td>{{ (item.body_text or '')[:60] }}</td>
 <td>{{ item.price if item.price is not none else '' }}</td>
 <td>{{ item.stock_quantity if item.stock_quantity is not none else '' }}</td>
 <td>{{ item.sort_order }}</td>
 <td>{{ 'Yes' if item.active else 'No' }}</td>
 <td>
-<a class="edit" href="{{ url_for('admin_edit', item_id=item.id) }}">Edit</a>
-<form class="inline" method="post" action="{{ url_for('admin_delete', item_id=item.id) }}" onsubmit="return confirm('Delete this item?')">
+<a class="edit" href="{{ url_for('admin_edit', item_id=item.id, parent=current_parent) }}">Edit</a>
+<form class="inline" method="post" action="{{ url_for('admin_delete', item_id=item.id, parent=current_parent) }}" onsubmit="return confirm('Delete this item?')">
 <button class="del" type="submit">Delete</button>
 </form>
 </td>
 </tr>
 {% endfor %}
+{% if not items %}
+<tr><td colspan="8" style="text-align:center;color:#888;padding:20px">No items here yet. Add one below.</td></tr>
+{% endif %}
 </table>
 
 <div class="addbox">
@@ -1082,14 +1104,15 @@ a{color:#1565c0}
 </datalist>
 <label>Parent Key (pick where this item lives, or add a brand new category)</label>
 <select id="parent_key_select" onchange="toggleNewParent()">
-<option value="main">Top level (main menu)</option>
+<option value="main" {{ 'selected' if current_parent == 'main' else '' }}>Top level (main menu)</option>
 {% for key, label, depth, is_prod, is_train in item_tree %}
-<option value="{{ key }}" data-product="{{ '1' if is_prod else '0' }}" data-training="{{ '1' if is_train else '0' }}">{{ label }}</option>
+<option value="{{ key }}" data-product="{{ '1' if is_prod else '0' }}" data-training="{{ '1' if is_train else '0' }}" {{ 'selected' if current_parent == key else '' }}>{{ label }}</option>
 {% endfor %}
 <option value="__new__">+ Add New Category...</option>
 </select>
 <input type="text" id="parent_key_new" name="parent_key_new_visible" placeholder="New category key, e.g. mushroom_beverage" style="display:none">
-<input type="hidden" name="parent_key" id="parent_key_hidden" value="main">
+<input type="hidden" name="parent_key" id="parent_key_hidden" value="{{ current_parent }}">
+<input type="hidden" name="return_parent" value="{{ current_parent }}">
 <label>Title (button label shown in WhatsApp, keep short)</label>
 <input type="text" name="title" required>
 <label>Body Text (message sent when selected -- leave blank if this item has its own submenu)</label>
@@ -1209,6 +1232,7 @@ a{display:inline-block;margin-top:10px}
 </select>
 <input type="text" id="parent_key_new" name="parent_key_new_visible" placeholder="New category key, e.g. mushroom_beverage" style="display:none">
 <input type="hidden" name="parent_key" id="parent_key_hidden" value="{{ item.parent_key }}">
+<input type="hidden" name="return_parent" value="{{ return_parent }}">
 <label>Title</label>
 <input type="text" name="title" value="{{ item.title }}" required>
 <label>Body Text</label>
@@ -1250,7 +1274,7 @@ a{display:inline-block;margin-top:10px}
 
 <button class="save" type="submit">Save Changes</button>
 </form>
-<a href="{{ url_for('admin_panel') }}">&larr; Back to list</a>
+<a href="{{ url_for('admin_panel', parent=return_parent) }}">&larr; Back to list</a>
 <script>
 function toggleItemType() {
     var t = document.getElementById('item_type').value;
@@ -1517,14 +1541,36 @@ def build_item_tree(items, exclude_key=None):
 @app.route('/admin')
 @login_required
 def admin_panel():
+    current_parent = request.args.get('parent', 'main')
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cursor.execute("SELECT * FROM menu_items ORDER BY parent_key ASC, sort_order ASC, id ASC")
-    items = cursor.fetchall()
+    all_items = cursor.fetchall()
     cursor.close()
     conn.close()
-    item_tree = build_item_tree(items)
-    return render_template_string(ADMIN_HTML, items=items, item_tree=item_tree, nav=render_template_string(NAV_HTML))
+
+    by_key = {it["item_key"]: it for it in all_items}
+    parent_keys_in_use = {it["parent_key"] for it in all_items}
+
+    items = [it for it in all_items if it["parent_key"] == current_parent]
+
+    breadcrumb = [("main", "Main Menu")]
+    trail = []
+    cursor_key = current_parent
+    seen = set()
+    while cursor_key != "main" and cursor_key in by_key and cursor_key not in seen:
+        seen.add(cursor_key)
+        trail.insert(0, (cursor_key, by_key[cursor_key]["title"]))
+        cursor_key = by_key[cursor_key]["parent_key"]
+    breadcrumb += trail
+
+    item_tree = build_item_tree(all_items)
+    return render_template_string(
+        ADMIN_HTML, items=items, item_tree=item_tree,
+        current_parent=current_parent, breadcrumb=breadcrumb,
+        parent_keys_in_use=parent_keys_in_use,
+        nav=render_template_string(NAV_HTML)
+    )
 
 
 @app.route('/admin/broadcast', methods=['GET', 'POST'])
@@ -1660,7 +1706,8 @@ def admin_add():
     conn.commit()
     cursor.close()
     conn.close()
-    return redirect(url_for('admin_panel'))
+    return_parent = request.form.get('return_parent', 'main')
+    return redirect(url_for('admin_panel', parent=return_parent))
 
 
 @app.route('/admin/edit/<int:item_id>', methods=['GET', 'POST'])
@@ -1700,7 +1747,8 @@ def admin_edit(item_id):
         conn.commit()
         cursor.close()
         conn.close()
-        return redirect(url_for('admin_panel'))
+        return_parent = request.form.get('return_parent', 'main')
+        return redirect(url_for('admin_panel', parent=return_parent))
 
     cursor.execute("SELECT * FROM menu_items WHERE id = %s", (item_id,))
     item = cursor.fetchone()
@@ -1709,19 +1757,21 @@ def admin_edit(item_id):
     cursor.close()
     conn.close()
     item_tree = build_item_tree(all_items, exclude_key=item["item_key"] if item else None)
-    return render_template_string(EDIT_HTML, item=item, item_tree=item_tree)
+    return_parent = request.args.get('parent', item["parent_key"] if item else "main")
+    return render_template_string(EDIT_HTML, item=item, item_tree=item_tree, return_parent=return_parent)
 
 
 @app.route('/admin/delete/<int:item_id>', methods=['POST'])
 @login_required
 def admin_delete(item_id):
+    return_parent = request.args.get('parent', 'main')
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM menu_items WHERE id = %s", (item_id,))
     conn.commit()
     cursor.close()
     conn.close()
-    return redirect(url_for('admin_panel'))
+    return redirect(url_for('admin_panel', parent=return_parent))
 
 
 @app.route('/')
