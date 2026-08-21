@@ -346,7 +346,7 @@ def get_cart(phone):
         return []
 
 
-def add_to_cart(phone, item_key, title, quantity):
+def add_to_cart(phone, item_key, title, quantity, price=None):
     import json
     items = get_cart(phone)
     found = False
@@ -356,7 +356,7 @@ def add_to_cart(phone, item_key, title, quantity):
             found = True
             break
     if not found:
-        items.append({"item_key": item_key, "title": title, "quantity": quantity})
+        items.append({"item_key": item_key, "title": title, "quantity": quantity, "price": price})
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -411,6 +411,20 @@ def clear_cart_flow(phone):
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def parse_price_number(price_str):
+    """Extracts the leading numeric amount from a price string like '150 INR' -> 150.0. Returns None if not parseable."""
+    if price_str is None:
+        return None
+    import re
+    match = re.search(r"[\d,]+(\.\d+)?", str(price_str))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def submit_cart_order(phone):
@@ -824,7 +838,7 @@ def webhook():
                 send_message(sender, f"Sorry, only {stock} in stock. Please enter a smaller number:")
                 return jsonify({"status": "received"}), 200
 
-            add_to_cart(sender, cart_flow["item_key"], cart_flow["item_title"], qty)
+            add_to_cart(sender, cart_flow["item_key"], cart_flow["item_title"], qty, price=(flow_item.get("price") if flow_item else None))
             clear_cart_flow(sender)
             send_buttons(
                 sender,
@@ -1282,34 +1296,35 @@ a{color:#1565c0}
 ORDERS_HTML = """
 <!doctype html><html><head><title>Orders</title>
 <style>
-body{font-family:sans-serif;max-width:1100px;margin:30px auto;padding:0 20px}
+body{font-family:sans-serif;max-width:1200px;margin:30px auto;padding:0 20px}
 table{width:100%;border-collapse:collapse}
 th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:14px;vertical-align:top}
 th{background:#2e7d32;color:#fff}
 a{color:#1565c0}
-pre{white-space:pre-wrap;font-size:12px;margin:0}
 select{padding:4px}
 </style></head><body>
 <h2>MUSHBOT Orders</h2>
 {{ nav|safe }}
 <table>
-<tr><th>ID</th><th>Customer WA #</th><th>Items</th><th>Total</th><th>Status</th><th>Placed</th></tr>
-{% for o in orders %}
+<tr><th>Order ID</th><th>Customer WA #</th><th>Product Name</th><th>Quantity</th><th>Price per item</th><th>Total Price</th><th>Status</th><th>Date</th></tr>
+{% for row in rows %}
 <tr>
-<td>{{ o.id }}</td>
-<td>{{ o.customer_phone }}</td>
-<td><pre>{{ o.items_json }}</pre>{% if o.order_text %}<br><em>{{ o.order_text }}</em>{% endif %}</td>
-<td>{{ o.currency or '' }} {{ o.total_amount }}</td>
+<td>{{ row.order_id }}</td>
+<td>{{ row.customer_phone }}</td>
+<td>{{ row.title }}</td>
+<td>{{ row.quantity }}</td>
+<td>{{ row.price_display }}</td>
+<td>{{ row.total_display }}</td>
 <td>
-<form class="inline" method="post" action="{{ url_for('admin_order_status', order_id=o.id) }}">
+<form class="inline" method="post" action="{{ url_for('admin_order_status', order_id=row.order_id) }}">
 <select name="status" onchange="this.form.submit()">
 {% for s in ['new','confirmed','shipped','delivered','cancelled'] %}
-<option value="{{ s }}" {{ 'selected' if o.status==s else '' }}>{{ s }}</option>
+<option value="{{ s }}" {{ 'selected' if row.status==s else '' }}>{{ s }}</option>
 {% endfor %}
 </select>
 </form>
 </td>
-<td>{{ o.created_at }}</td>
+<td>{{ row.created_at }}</td>
 </tr>
 {% endfor %}
 </table>
@@ -1392,13 +1407,49 @@ def admin_trainings():
 @app.route('/admin/orders')
 @login_required
 def admin_orders():
+    import json
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cursor.execute("SELECT * FROM orders ORDER BY created_at DESC")
     orders = cursor.fetchall()
     cursor.close()
     conn.close()
-    return render_template_string(ORDERS_HTML, orders=orders, nav=render_template_string(NAV_HTML))
+
+    rows = []
+    for o in orders:
+        try:
+            items = json.loads(o["items_json"]) if o["items_json"] else []
+        except (TypeError, ValueError):
+            items = []
+        if not items:
+            rows.append({
+                "order_id": o["id"], "customer_phone": o["customer_phone"],
+                "title": o.get("order_text") or "(no items)", "quantity": "",
+                "price_display": "", "total_display": "",
+                "status": o["status"], "created_at": o["created_at"]
+            })
+            continue
+        for it in items:
+            qty = it.get("quantity", 0)
+            price_raw = it.get("price") or it.get("item_price")
+            price_num = parse_price_number(price_raw)
+            total_display = ""
+            if price_num is not None:
+                total_display = f"{price_num * qty:.2f}"
+                if isinstance(price_raw, str):
+                    currency_suffix = "".join(ch for ch in price_raw if ch.isalpha())
+                    if currency_suffix:
+                        total_display = f"{total_display} {currency_suffix}"
+            rows.append({
+                "order_id": o["id"], "customer_phone": o["customer_phone"],
+                "title": it.get("title") or it.get("product_retailer_id") or "-",
+                "quantity": qty,
+                "price_display": price_raw if price_raw is not None else "",
+                "total_display": total_display,
+                "status": o["status"], "created_at": o["created_at"]
+            })
+
+    return render_template_string(ORDERS_HTML, rows=rows, nav=render_template_string(NAV_HTML))
 
 
 @app.route('/admin/orders/<int:order_id>/status', methods=['POST'])
