@@ -1085,6 +1085,20 @@ a{color:#1565c0}
 {% endif %}
 </table>
 
+<div style="display:flex;justify-content:center;align-items:center;gap:15px;margin:16px 0">
+{% if page > 1 %}
+<a href="{{ url_for('admin_panel', parent=current_parent, page=page-1) }}"><button type="button">&larr; Back</button></a>
+{% else %}
+<button type="button" disabled>&larr; Back</button>
+{% endif %}
+<span>Page {{ page }} of {{ total_pages }}</span>
+{% if page < total_pages %}
+<a href="{{ url_for('admin_panel', parent=current_parent, page=page+1) }}"><button type="button">Next &rarr;</button></a>
+{% else %}
+<button type="button" disabled>Next &rarr;</button>
+{% endif %}
+</div>
+
 <div class="addbox">
 <h3>Add New Menu Item</h3>
 <form method="post" action="{{ url_for('admin_add') }}" enctype="multipart/form-data" onsubmit="return syncParentKey()" id="add_item_form">
@@ -1554,6 +1568,17 @@ def admin_panel():
 
     items = [it for it in all_items if it["parent_key"] == current_parent]
 
+    page = request.args.get('page', 1, type=int)
+    if page < 1:
+        page = 1
+    page_size = 4
+    total_items = len(items)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    if page > total_pages:
+        page = total_pages
+    start = (page - 1) * page_size
+    page_items = items[start:start + page_size]
+
     breadcrumb = [("main", "Main Menu")]
     trail = []
     cursor_key = current_parent
@@ -1566,9 +1591,10 @@ def admin_panel():
 
     item_tree = build_item_tree(all_items)
     return render_template_string(
-        ADMIN_HTML, items=items, item_tree=item_tree,
+        ADMIN_HTML, items=page_items, item_tree=item_tree,
         current_parent=current_parent, breadcrumb=breadcrumb,
         parent_keys_in_use=parent_keys_in_use,
+        page=page, total_pages=total_pages,
         nav=render_template_string(NAV_HTML)
     )
 
