@@ -1076,15 +1076,15 @@ a{color:#1565c0}
 <label>Item Key (unique, lowercase, no spaces)</label>
 <input type="text" name="item_key" required list="existing_keys_list">
 <datalist id="existing_keys_list">
-{% for key, label, depth in item_tree %}
+{% for key, label, depth, is_prod, is_train in item_tree %}
 <option value="{{ key }}">{{ label }}</option>
 {% endfor %}
 </datalist>
 <label>Parent Key (pick where this item lives, or add a brand new category)</label>
 <select id="parent_key_select" onchange="toggleNewParent()">
 <option value="main">Top level (main menu)</option>
-{% for key, label, depth in item_tree %}
-<option value="{{ key }}">{{ label }}</option>
+{% for key, label, depth, is_prod, is_train in item_tree %}
+<option value="{{ key }}" data-product="{{ '1' if is_prod else '0' }}" data-training="{{ '1' if is_train else '0' }}">{{ label }}</option>
 {% endfor %}
 <option value="__new__">+ Add New Category...</option>
 </select>
@@ -1133,8 +1133,29 @@ function toggleItemType() {
     document.getElementById('sellable').checked = (t === 'product');
     document.getElementById('collects_registration').checked = (t === 'training');
     document.getElementById('opens_catalog').checked = false;
+    filterParentOptions(t);
 }
 toggleItemType();
+
+function filterParentOptions(t) {
+    var sel = document.getElementById('parent_key_select');
+    var options = sel.querySelectorAll('option');
+    var selectedHidden = false;
+    options.forEach(function(opt) {
+        if (opt.value === 'main' || opt.value === '__new__') {
+            opt.style.display = 'block';
+            return;
+        }
+        var isProd = opt.getAttribute('data-product') === '1';
+        var isTrain = opt.getAttribute('data-training') === '1';
+        var visible = true;
+        if (t === 'product') visible = isProd;
+        else if (t === 'training') visible = isTrain;
+        opt.style.display = visible ? 'block' : 'none';
+        if (!visible && opt.selected) selectedHidden = true;
+    });
+    if (selectedHidden) sel.value = 'main';
+}
 
 function toggleNewParent() {
     var sel = document.getElementById('parent_key_select');
@@ -1181,8 +1202,8 @@ a{display:inline-block;margin-top:10px}
 <label>Parent Key (pick where this item lives, or add a brand new category)</label>
 <select id="parent_key_select" onchange="toggleNewParent()">
 <option value="main" {{ 'selected' if item.parent_key == 'main' else '' }}>Top level (main menu)</option>
-{% for key, label, depth in item_tree %}
-<option value="{{ key }}" {{ 'selected' if item.parent_key == key else '' }}>{{ label }}</option>
+{% for key, label, depth, is_prod, is_train in item_tree %}
+<option value="{{ key }}" data-product="{{ '1' if is_prod else '0' }}" data-training="{{ '1' if is_train else '0' }}" {{ 'selected' if item.parent_key == key else '' }}>{{ label }}</option>
 {% endfor %}
 <option value="__new__">+ Add New Category...</option>
 </select>
@@ -1237,8 +1258,29 @@ function toggleItemType() {
     document.getElementById('training-fields').style.display = (t === 'training') ? 'block' : 'none';
     document.getElementById('sellable').checked = (t === 'product');
     document.getElementById('collects_registration').checked = (t === 'training');
+    filterParentOptions(t);
 }
 toggleItemType();
+
+function filterParentOptions(t) {
+    var sel = document.getElementById('parent_key_select');
+    var options = sel.querySelectorAll('option');
+    var selectedHidden = false;
+    options.forEach(function(opt) {
+        if (opt.value === 'main' || opt.value === '__new__') {
+            opt.style.display = 'block';
+            return;
+        }
+        var isProd = opt.getAttribute('data-product') === '1';
+        var isTrain = opt.getAttribute('data-training') === '1';
+        var visible = true;
+        if (t === 'product') visible = isProd;
+        else if (t === 'training') visible = isTrain;
+        opt.style.display = visible ? 'block' : 'none';
+        if (!visible && opt.selected) selectedHidden = true;
+    });
+    if (selectedHidden) sel.value = 'main';
+}
 
 function toggleNewParent() {
     var sel = document.getElementById('parent_key_select');
@@ -1425,12 +1467,34 @@ def admin_logout():
 
 
 def build_item_tree(items, exclude_key=None):
-    """Builds an ordered [(item_key, display_label, depth)] list reflecting the parent/child hierarchy."""
+    """Builds an ordered [(item_key, display_label, depth, is_product_branch, is_training_branch)] list
+    reflecting the parent/child hierarchy. A branch is tagged 'product' or 'training' if ANY item under
+    its top-level ancestor is sellable / collects_registration, so the whole branch can be filtered together."""
+    by_key = {it["item_key"]: it for it in items}
     by_parent = {}
     for it in items:
         by_parent.setdefault(it["parent_key"], []).append(it)
     for children in by_parent.values():
         children.sort(key=lambda x: (x["sort_order"], x["id"]))
+
+    def root_of(item_key, seen=None):
+        seen = seen or set()
+        if item_key in seen:
+            return item_key
+        seen.add(item_key)
+        it = by_key.get(item_key)
+        if not it or it["parent_key"] == "main" or it["parent_key"] not in by_key:
+            return item_key
+        return root_of(it["parent_key"], seen)
+
+    roots_with_sellable = set()
+    roots_with_training = set()
+    for it in items:
+        r = root_of(it["item_key"])
+        if it.get("sellable"):
+            roots_with_sellable.add(r)
+        if it.get("collects_registration"):
+            roots_with_training.add(r)
 
     tree = []
 
@@ -1440,7 +1504,10 @@ def build_item_tree(items, exclude_key=None):
                 continue
             seen.add(it["item_key"])
             indent = "\u2014 " * depth
-            tree.append((it["item_key"], f"{indent}{it['title']} ({it['item_key']})", depth))
+            r = root_of(it["item_key"])
+            is_product_branch = r in roots_with_sellable
+            is_training_branch = r in roots_with_training
+            tree.append((it["item_key"], f"{indent}{it['title']} ({it['item_key']})", depth, is_product_branch, is_training_branch))
             walk(it["item_key"], depth + 1, seen)
 
     walk("main", 0, set())
