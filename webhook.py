@@ -92,6 +92,10 @@ def init_db():
     conn.commit()
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS sellable BOOLEAN DEFAULT FALSE")
     conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS price TEXT")
+    conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS stock_quantity INTEGER")
+    conn.commit()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS customers (
         id SERIAL PRIMARY KEY,
@@ -422,6 +426,11 @@ def submit_cart_order(phone):
         VALUES (%s, %s, %s, 'new') RETURNING id
     """, (phone, json.dumps(items), f"{total_qty} item(s) via product interest flow"))
     order_id = cursor.fetchone()[0]
+    for it in items:
+        cursor.execute(
+            "UPDATE menu_items SET stock_quantity = GREATEST(stock_quantity - %s, 0) WHERE item_key = %s AND stock_quantity IS NOT NULL",
+            (it["quantity"], it["item_key"])
+        )
     conn.commit()
     cursor.close()
     conn.close()
@@ -809,6 +818,12 @@ def webhook():
                 send_message(sender, "Please enter a valid whole number for quantity (e.g. 1, 2, 5):")
                 return jsonify({"status": "received"}), 200
 
+            flow_item = get_item(cart_flow["item_key"])
+            stock = flow_item.get("stock_quantity") if flow_item else None
+            if stock is not None and qty > stock:
+                send_message(sender, f"Sorry, only {stock} in stock. Please enter a smaller number:")
+                return jsonify({"status": "received"}), 200
+
             add_to_cart(sender, cart_flow["item_key"], cart_flow["item_title"], qty)
             clear_cart_flow(sender)
             send_buttons(
@@ -913,17 +928,31 @@ def webhook():
                 elif children:
                     send_menu(sender, item["item_key"], item["title"] + ":")
                 elif item.get("sellable"):
-                    if item["body_text"]:
-                        if item.get("image_url"):
-                            send_image(sender, item["image_url"], caption=item["body_text"])
-                        else:
-                            send_message(sender, item["body_text"])
-                    elif item.get("image_url"):
-                        send_image(sender, item["image_url"])
-                    send_buttons(sender, "Interested in this product?", [
-                        {"id": f"interested__{item['item_key']}", "title": "I'm Interested"},
-                        {"id": "cart_browse_more", "title": "Browse More"}
-                    ])
+                    detail = item["body_text"] or ""
+                    extra_lines = []
+                    if item.get("price") is not None:
+                        extra_lines.append(f"\U0001F4B0 Price: {item['price']}")
+                    stock = item.get("stock_quantity")
+                    out_of_stock = stock is not None and stock <= 0
+                    if stock is not None:
+                        extra_lines.append(f"\U0001F4E6 In stock: {stock}" if not out_of_stock else "\U0001F4E6 Out of stock")
+                    if extra_lines:
+                        detail = (detail + "\n\n" if detail else "") + "\n".join(extra_lines)
+
+                    if item.get("image_url"):
+                        send_image(sender, item["image_url"], caption=detail or None)
+                    elif detail:
+                        send_message(sender, detail)
+
+                    if out_of_stock:
+                        send_buttons(sender, "This item is currently out of stock.", [
+                            {"id": "cart_browse_more", "title": "Browse More"}
+                        ])
+                    else:
+                        send_buttons(sender, "Interested in this product?", [
+                            {"id": f"interested__{item['item_key']}", "title": "I'm Interested"},
+                            {"id": "cart_browse_more", "title": "Browse More"}
+                        ])
                 elif item.get("collects_registration"):
                     detail = item["body_text"] or ""
                     time_line = format_training_datetime(item)
@@ -998,7 +1027,7 @@ a{color:#1565c0}
 {{ nav|safe }}
 
 <table>
-<tr><th>Image</th><th>Key</th><th>Parent</th><th>Title</th><th>Body Text</th><th>Order</th><th>Active</th><th>Actions</th></tr>
+<tr><th>Image</th><th>Key</th><th>Parent</th><th>Title</th><th>Body Text</th><th>Price</th><th>Stock</th><th>Order</th><th>Active</th><th>Actions</th></tr>
 {% for item in items %}
 <tr>
 <td>{% if item.image_url %}<img src="{{ item.image_url }}" style="width:50px;height:50px;object-fit:cover;border-radius:4px">{% endif %}</td>
@@ -1006,6 +1035,8 @@ a{color:#1565c0}
 <td>{{ item.parent_key }}</td>
 <td>{{ item.title }}</td>
 <td>{{ (item.body_text or '')[:60] }}</td>
+<td>{{ item.price if item.price is not none else '' }}</td>
+<td>{{ item.stock_quantity if item.stock_quantity is not none else '' }}</td>
 <td>{{ item.sort_order }}</td>
 <td>{{ 'Yes' if item.active else 'No' }}</td>
 <td>
@@ -1021,6 +1052,13 @@ a{color:#1565c0}
 <div class="addbox">
 <h3>Add New Menu Item</h3>
 <form method="post" action="{{ url_for('admin_add') }}" enctype="multipart/form-data">
+<label>Item Type</label>
+<select id="item_type" onchange="toggleItemType()">
+<option value="category">Category / Submenu (no special fields)</option>
+<option value="product">Product (price, stock, "I'm Interested" button)</option>
+<option value="training">Training (date, time, venue, "Join Training" button)</option>
+<option value="info">Info page (just shows text/image)</option>
+</select>
 <label>Item Key (unique, lowercase, no spaces)</label>
 <input type="text" name="item_key" required>
 <label>Parent Key (use "main" for top-level, or another item's key for a submenu)</label>
@@ -1033,18 +1071,44 @@ a{color:#1565c0}
 <input type="file" name="image" accept="image/*">
 <label>Sort Order (number, lower shows first)</label>
 <input type="number" name="sort_order" value="0">
-<label><input type="checkbox" name="collects_registration" style="width:auto"> Collects training registration (starts a name/phone/address/email sign-up flow instead of just showing text)</label>
-<label><input type="checkbox" name="opens_catalog" style="width:auto"> Opens WhatsApp Catalog (shows the full scrollable product catalog with cart/ordering instead of a submenu -- requires Catalog setup)</label>
-<label><input type="checkbox" name="sellable" style="width:auto"> Sellable (adds an "I'm Interested" button -- customers can specify quantity and submit an order, saved to your Orders page)</label>
-<label>Training Date (only used if "Collects training registration" is ticked)</label>
+
+<div id="product-fields" style="display:none;border-top:1px solid #ccc;margin-top:10px;padding-top:10px">
+<label>Price (per item, e.g. 150 or 150 INR)</label>
+<input type="text" name="price">
+<label>Stock Quantity (how many are currently available)</label>
+<input type="number" name="stock_quantity" min="0">
+</div>
+
+<div id="training-fields" style="display:none;border-top:1px solid #ccc;margin-top:10px;padding-top:10px">
+<label>Training Date</label>
 <input type="date" name="training_date">
 <label>Training Time (24-hour, with seconds)</label>
 <input type="time" name="training_time_clock" step="1">
-<label>Training Venue (only used if the checkbox above is ticked)</label>
+<label>Training Venue</label>
 <input type="text" name="training_venue">
+</div>
+
+<div style="display:none">
+<input type="checkbox" name="collects_registration" id="collects_registration">
+<input type="checkbox" name="opens_catalog" id="opens_catalog">
+<input type="checkbox" name="sellable" id="sellable">
+</div>
+
 <button class="save" type="submit">Add Item</button>
 </form>
 </div>
+
+<script>
+function toggleItemType() {
+    var t = document.getElementById('item_type').value;
+    document.getElementById('product-fields').style.display = (t === 'product') ? 'block' : 'none';
+    document.getElementById('training-fields').style.display = (t === 'training') ? 'block' : 'none';
+    document.getElementById('sellable').checked = (t === 'product');
+    document.getElementById('collects_registration').checked = (t === 'training');
+    document.getElementById('opens_catalog').checked = false;
+}
+toggleItemType();
+</script>
 
 </body></html>
 """
@@ -1071,18 +1135,49 @@ a{display:inline-block;margin-top:10px}
 <label>Sort Order</label>
 <input type="number" name="sort_order" value="{{ item.sort_order }}">
 <label><input type="checkbox" name="active" {{ 'checked' if item.active else '' }} style="width:auto"> Active</label>
-<label><input type="checkbox" name="collects_registration" {{ 'checked' if item.collects_registration else '' }} style="width:auto"> Collects training registration</label>
-<label><input type="checkbox" name="opens_catalog" {{ 'checked' if item.opens_catalog else '' }} style="width:auto"> Opens WhatsApp Catalog (full product catalog with cart/ordering)</label>
-<label><input type="checkbox" name="sellable" {{ 'checked' if item.sellable else '' }} style="width:auto"> Sellable (adds an "I'm Interested" button with quantity + order submission)</label>
-<label>Training Date (only used if "Collects training registration" is ticked)</label>
+
+<label>Item Type</label>
+<select id="item_type" onchange="toggleItemType()">
+<option value="category" {{ 'selected' if (not item.sellable and not item.collects_registration) else '' }}>Category / Submenu / Info (no special fields)</option>
+<option value="product" {{ 'selected' if item.sellable else '' }}>Product (price, stock, "I'm Interested" button)</option>
+<option value="training" {{ 'selected' if item.collects_registration else '' }}>Training (date, time, venue, "Join Training" button)</option>
+</select>
+
+<div id="product-fields" style="display:none;border-top:1px solid #ccc;margin-top:10px;padding-top:10px">
+<label>Price (per item, e.g. 150 or 150 INR)</label>
+<input type="text" name="price" value="{{ item.price if item.price is not none else '' }}">
+<label>Stock Quantity (how many are currently available)</label>
+<input type="number" name="stock_quantity" min="0" value="{{ item.stock_quantity if item.stock_quantity is not none else '' }}">
+</div>
+
+<div id="training-fields" style="display:none;border-top:1px solid #ccc;margin-top:10px;padding-top:10px">
+<label>Training Date</label>
 <input type="date" name="training_date" value="{{ item.training_date.strftime('%Y-%m-%d') if item.training_date else '' }}">
 <label>Training Time (24-hour, with seconds)</label>
 <input type="time" name="training_time_clock" step="1" value="{{ item.training_time_clock.strftime('%H:%M:%S') if item.training_time_clock else '' }}">
-<label>Training Venue (only used if the checkbox above is ticked)</label>
+<label>Training Venue</label>
 <input type="text" name="training_venue" value="{{ item.training_venue or '' }}">
+</div>
+
+<div style="display:none">
+<input type="checkbox" name="collects_registration" id="collects_registration" {{ 'checked' if item.collects_registration else '' }}>
+<input type="checkbox" name="opens_catalog" id="opens_catalog" {{ 'checked' if item.opens_catalog else '' }}>
+<input type="checkbox" name="sellable" id="sellable" {{ 'checked' if item.sellable else '' }}>
+</div>
+
 <button class="save" type="submit">Save Changes</button>
 </form>
 <a href="{{ url_for('admin_panel') }}">&larr; Back to list</a>
+<script>
+function toggleItemType() {
+    var t = document.getElementById('item_type').value;
+    document.getElementById('product-fields').style.display = (t === 'product') ? 'block' : 'none';
+    document.getElementById('training-fields').style.display = (t === 'training') ? 'block' : 'none';
+    document.getElementById('sellable').checked = (t === 'product');
+    document.getElementById('collects_registration').checked = (t === 'training');
+}
+toggleItemType();
+</script>
 </body></html>
 """
 
@@ -1334,13 +1429,16 @@ def admin_add():
     training_date_str = request.form.get('training_date', '').strip() or None
     training_time_clock_str = request.form.get('training_time_clock', '').strip() or None
     training_venue = request.form.get('training_venue', '').strip() or None
+    price_str = request.form.get('price', '').strip() or None
+    stock_str = request.form.get('stock_quantity', '').strip()
+    stock_quantity = int(stock_str) if stock_str.isdigit() else None
     image_url = upload_image_to_supabase(request.files.get('image'))
 
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_date, training_time_clock, training_venue, opens_catalog, sellable) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable)
+        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_date, training_time_clock, training_venue, opens_catalog, sellable, price, stock_quantity) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable, price_str, stock_quantity)
     )
     conn.commit()
     cursor.close()
@@ -1367,17 +1465,20 @@ def admin_edit(item_id):
         training_date_str = request.form.get('training_date', '').strip() or None
         training_time_clock_str = request.form.get('training_time_clock', '').strip() or None
         training_venue = request.form.get('training_venue', '').strip() or None
+        price_str = request.form.get('price', '').strip() or None
+        stock_str = request.form.get('stock_quantity', '').strip()
+        stock_quantity = int(stock_str) if stock_str.isdigit() else None
 
         new_image_url = upload_image_to_supabase(request.files.get('image'))
         if new_image_url:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_date=%s, training_time_clock=%s, training_venue=%s, opens_catalog=%s, sellable=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_date=%s, training_time_clock=%s, training_venue=%s, opens_catalog=%s, sellable=%s, price=%s, stock_quantity=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable, price_str, stock_quantity, item_id)
             )
         else:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_date=%s, training_time_clock=%s, training_venue=%s, opens_catalog=%s, sellable=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_date=%s, training_time_clock=%s, training_venue=%s, opens_catalog=%s, sellable=%s, price=%s, stock_quantity=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable, price_str, stock_quantity, item_id)
             )
         conn.commit()
         cursor.close()
