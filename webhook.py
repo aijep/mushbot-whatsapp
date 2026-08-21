@@ -1,10 +1,10 @@
 import os
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, Response
 import requests
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
+from datetime import datetime, date
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key")
@@ -1415,9 +1415,19 @@ table{width:100%;border-collapse:collapse}
 th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:14px}
 th{background:#2e7d32;color:#fff}
 a{color:#1565c0}
+.export-bar{margin:10px 0 20px;font-size:14px}
+.export-bar a{margin-right:12px;background:#eee;padding:6px 12px;border-radius:4px;text-decoration:none;color:#333}
+.export-bar a:hover{background:#ddd}
 </style></head><body>
 <h2>MUSHBOT Customers</h2>
 {{ nav|safe }}
+<div class="export-bar">
+Export CSV:
+<a href="{{ url_for('admin_customers_export', range='daily') }}">Daily</a>
+<a href="{{ url_for('admin_customers_export', range='monthly') }}">Monthly</a>
+<a href="{{ url_for('admin_customers_export', range='yearly') }}">Yearly</a>
+<a href="{{ url_for('admin_customers_export', range='all') }}">All</a>
+</div>
 <table>
 <tr><th>Phone</th><th>Name</th><th>Address</th><th>Email</th><th>Stage</th><th>Joined</th></tr>
 {% for c in customers %}
@@ -1443,9 +1453,26 @@ table{width:100%;border-collapse:collapse}
 th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:14px}
 th{background:#2e7d32;color:#fff}
 a{color:#1565c0}
+.export-bar{margin:10px 0 20px;font-size:14px}
+.export-bar a{margin-right:12px;background:#eee;padding:6px 12px;border-radius:4px;text-decoration:none;color:#333}
+.export-bar a:hover{background:#ddd}
 </style></head><body>
 <h2>MUSHBOT Training Registrations</h2>
 {{ nav|safe }}
+<div class="export-bar">
+Export Participation CSV:
+<a href="{{ url_for('admin_trainings_export', range='daily') }}">Daily</a>
+<a href="{{ url_for('admin_trainings_export', range='monthly') }}">Monthly</a>
+<a href="{{ url_for('admin_trainings_export', range='yearly') }}">Yearly</a>
+<a href="{{ url_for('admin_trainings_export', range='all') }}">All</a>
+</div>
+<div class="export-bar">
+Export Trainings Catalog CSV (by scheduled date):
+<a href="{{ url_for('admin_trainings_catalog_export', range='daily') }}">Daily</a>
+<a href="{{ url_for('admin_trainings_catalog_export', range='monthly') }}">Monthly</a>
+<a href="{{ url_for('admin_trainings_catalog_export', range='yearly') }}">Yearly</a>
+<a href="{{ url_for('admin_trainings_catalog_export', range='all') }}">All</a>
+</div>
 <table>
 <tr><th>Training</th><th>Name</th><th>Phone</th><th>Address</th><th>Email</th><th>Customer WA #</th><th>Registered</th></tr>
 {% for r in regs %}
@@ -1473,9 +1500,19 @@ th,td{border:1px solid #ccc;padding:8px;text-align:left;font-size:14px;vertical-
 th{background:#2e7d32;color:#fff}
 a{color:#1565c0}
 select{padding:4px}
+.export-bar{margin:10px 0 20px;font-size:14px}
+.export-bar a{margin-right:12px;background:#eee;padding:6px 12px;border-radius:4px;text-decoration:none;color:#333}
+.export-bar a:hover{background:#ddd}
 </style></head><body>
 <h2>MUSHBOT Orders</h2>
 {{ nav|safe }}
+<div class="export-bar">
+Export CSV:
+<a href="{{ url_for('admin_orders_export', range='daily') }}">Daily</a>
+<a href="{{ url_for('admin_orders_export', range='monthly') }}">Monthly</a>
+<a href="{{ url_for('admin_orders_export', range='yearly') }}">Yearly</a>
+<a href="{{ url_for('admin_orders_export', range='all') }}">All</a>
+</div>
 <table>
 <tr><th>Order ID</th><th>Customer WA #</th><th>Product Name</th><th>Quantity</th><th>Price per item</th><th>Total Price</th><th>Status</th><th>Date</th></tr>
 {% for row in rows %}
@@ -1518,6 +1555,58 @@ def admin_login():
 def admin_logout():
     session.pop('admin_logged_in', None)
     return redirect(url_for('admin_login'))
+
+
+def csv_response(fieldnames, rows, filename):
+    import csv
+    import io
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    resp = Response(output.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
+
+
+def filter_by_timestamp_range(rows, range_param, field="created_at"):
+    """range_param: 'daily' | 'monthly' | 'yearly' | 'all'. Filters rows whose [field] timestamp falls in the period."""
+    if range_param not in ("daily", "monthly", "yearly"):
+        return rows
+    today = date.today()
+    out = []
+    for r in rows:
+        ts = r.get(field)
+        if not ts:
+            continue
+        d = ts.date() if hasattr(ts, "date") else ts
+        if range_param == "daily" and d == today:
+            out.append(r)
+        elif range_param == "monthly" and d.year == today.year and d.month == today.month:
+            out.append(r)
+        elif range_param == "yearly" and d.year == today.year:
+            out.append(r)
+    return out
+
+
+def filter_by_date_range(rows, range_param, field="training_date"):
+    """Same as above but for a plain DATE field (e.g. a training's scheduled date)."""
+    if range_param not in ("daily", "monthly", "yearly"):
+        return rows
+    today = date.today()
+    out = []
+    for r in rows:
+        d = r.get(field)
+        if not d:
+            continue
+        if range_param == "daily" and d == today:
+            out.append(r)
+        elif range_param == "monthly" and d.year == today.year and d.month == today.month:
+            out.append(r)
+        elif range_param == "yearly" and d.year == today.year:
+            out.append(r)
+    return out
 
 
 def build_item_tree(items, exclude_key=None):
@@ -1646,6 +1735,23 @@ def admin_customers():
     return render_template_string(CUSTOMERS_HTML, customers=customers, nav=render_template_string(NAV_HTML))
 
 
+@app.route('/admin/customers/export')
+@login_required
+def admin_customers_export():
+    range_param = request.args.get('range', 'all')
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM customers ORDER BY created_at DESC")
+    customers = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    customers = filter_by_timestamp_range(customers, range_param, "created_at")
+    return csv_response(
+        ["phone", "name", "address", "email", "stage", "created_at", "completed_at"],
+        customers, f"customers_{range_param}.csv"
+    )
+
+
 @app.route('/admin/trainings')
 @login_required
 def admin_trainings():
@@ -1658,17 +1764,47 @@ def admin_trainings():
     return render_template_string(TRAININGS_HTML, regs=regs, nav=render_template_string(NAV_HTML))
 
 
-@app.route('/admin/orders')
+@app.route('/admin/trainings/export')
 @login_required
-def admin_orders():
-    import json
+def admin_trainings_export():
+    range_param = request.args.get('range', 'all')
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("SELECT * FROM orders ORDER BY created_at DESC")
-    orders = cursor.fetchall()
+    cursor.execute("SELECT * FROM training_registrations ORDER BY created_at DESC")
+    regs = cursor.fetchall()
     cursor.close()
     conn.close()
+    regs = filter_by_timestamp_range(regs, range_param, "created_at")
+    return csv_response(
+        ["training_title", "name", "phone_number", "address", "email", "customer_phone", "created_at"],
+        regs, f"training_participation_{range_param}.csv"
+    )
 
+
+@app.route('/admin/trainings-catalog/export')
+@login_required
+def admin_trainings_catalog_export():
+    range_param = request.args.get('range', 'all')
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM menu_items WHERE collects_registration = TRUE ORDER BY training_date ASC NULLS LAST")
+    trainings = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    trainings = filter_by_date_range(trainings, range_param, "training_date")
+    rows = [{
+        "item_key": t["item_key"], "title": t["title"],
+        "training_date": t["training_date"], "training_time": t["training_time_clock"],
+        "training_venue": t["training_venue"], "active": t["active"]
+    } for t in trainings]
+    return csv_response(
+        ["item_key", "title", "training_date", "training_time", "training_venue", "active"],
+        rows, f"trainings_catalog_{range_param}.csv"
+    )
+
+
+def build_order_rows(orders):
+    import json
     rows = []
     for o in orders:
         try:
@@ -1702,8 +1838,38 @@ def admin_orders():
                 "total_display": total_display,
                 "status": o["status"], "created_at": o["created_at"]
             })
+    return rows
 
+
+@app.route('/admin/orders')
+@login_required
+def admin_orders():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM orders ORDER BY created_at DESC")
+    orders = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    rows = build_order_rows(orders)
     return render_template_string(ORDERS_HTML, rows=rows, nav=render_template_string(NAV_HTML))
+
+
+@app.route('/admin/orders/export')
+@login_required
+def admin_orders_export():
+    range_param = request.args.get('range', 'all')
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM orders ORDER BY created_at DESC")
+    orders = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    orders = filter_by_timestamp_range(orders, range_param, "created_at")
+    rows = build_order_rows(orders)
+    return csv_response(
+        ["order_id", "customer_phone", "title", "quantity", "price_display", "total_display", "status", "created_at"],
+        rows, f"orders_{range_param}.csv"
+    )
 
 
 @app.route('/admin/orders/<int:order_id>/status', methods=['POST'])
