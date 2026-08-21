@@ -1441,6 +1441,19 @@ Export CSV:
 </tr>
 {% endfor %}
 </table>
+<div style="display:flex;justify-content:center;align-items:center;gap:15px;margin:16px 0">
+{% if page > 1 %}
+<a href="{{ url_for('admin_customers', page=page-1) }}"><button type="button">&larr; Back</button></a>
+{% else %}
+<button type="button" disabled>&larr; Back</button>
+{% endif %}
+<span>Page {{ page }} of {{ total_pages }}</span>
+{% if page < total_pages %}
+<a href="{{ url_for('admin_customers', page=page+1) }}"><button type="button">Next &rarr;</button></a>
+{% else %}
+<button type="button" disabled>Next &rarr;</button>
+{% endif %}
+</div>
 </body></html>
 """
 
@@ -1487,6 +1500,19 @@ Export Trainings Catalog CSV (by scheduled date):
 </tr>
 {% endfor %}
 </table>
+<div style="display:flex;justify-content:center;align-items:center;gap:15px;margin:16px 0">
+{% if page > 1 %}
+<a href="{{ url_for('admin_trainings', page=page-1) }}"><button type="button">&larr; Back</button></a>
+{% else %}
+<button type="button" disabled>&larr; Back</button>
+{% endif %}
+<span>Page {{ page }} of {{ total_pages }}</span>
+{% if page < total_pages %}
+<a href="{{ url_for('admin_trainings', page=page+1) }}"><button type="button">Next &rarr;</button></a>
+{% else %}
+<button type="button" disabled>Next &rarr;</button>
+{% endif %}
+</div>
 </body></html>
 """
 
@@ -1536,6 +1562,19 @@ Export CSV:
 </tr>
 {% endfor %}
 </table>
+<div style="display:flex;justify-content:center;align-items:center;gap:15px;margin:16px 0">
+{% if page > 1 %}
+<a href="{{ url_for('admin_orders', page=page-1) }}"><button type="button">&larr; Back</button></a>
+{% else %}
+<button type="button" disabled>&larr; Back</button>
+{% endif %}
+<span>Page {{ page }} of {{ total_pages }}</span>
+{% if page < total_pages %}
+<a href="{{ url_for('admin_orders', page=page+1) }}"><button type="button">Next &rarr;</button></a>
+{% else %}
+<button type="button" disabled>Next &rarr;</button>
+{% endif %}
+</div>
 </body></html>
 """
 
@@ -1555,6 +1594,17 @@ def admin_login():
 def admin_logout():
     session.pop('admin_logged_in', None)
     return redirect(url_for('admin_login'))
+
+
+def paginate(items, page, page_size=4):
+    total_items = len(items)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+    start = (page - 1) * page_size
+    return items[start:start + page_size], page, total_pages
 
 
 def csv_response(fieldnames, rows, filename):
@@ -1732,7 +1782,12 @@ def admin_customers():
     customers = cursor.fetchall()
     cursor.close()
     conn.close()
-    return render_template_string(CUSTOMERS_HTML, customers=customers, nav=render_template_string(NAV_HTML))
+    page = request.args.get('page', 1, type=int)
+    page_customers, page, total_pages = paginate(customers, page)
+    return render_template_string(
+        CUSTOMERS_HTML, customers=page_customers, page=page, total_pages=total_pages,
+        nav=render_template_string(NAV_HTML)
+    )
 
 
 @app.route('/admin/customers/export')
@@ -1761,7 +1816,12 @@ def admin_trainings():
     regs = cursor.fetchall()
     cursor.close()
     conn.close()
-    return render_template_string(TRAININGS_HTML, regs=regs, nav=render_template_string(NAV_HTML))
+    page = request.args.get('page', 1, type=int)
+    page_regs, page, total_pages = paginate(regs, page)
+    return render_template_string(
+        TRAININGS_HTML, regs=page_regs, page=page, total_pages=total_pages,
+        nav=render_template_string(NAV_HTML)
+    )
 
 
 @app.route('/admin/trainings/export')
@@ -1851,7 +1911,12 @@ def admin_orders():
     cursor.close()
     conn.close()
     rows = build_order_rows(orders)
-    return render_template_string(ORDERS_HTML, rows=rows, nav=render_template_string(NAV_HTML))
+    page = request.args.get('page', 1, type=int)
+    page_rows, page, total_pages = paginate(rows, page)
+    return render_template_string(
+        ORDERS_HTML, rows=page_rows, page=page, total_pages=total_pages,
+        nav=render_template_string(NAV_HTML)
+    )
 
 
 @app.route('/admin/orders/export')
