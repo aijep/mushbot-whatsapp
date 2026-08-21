@@ -82,6 +82,10 @@ def init_db():
     conn.commit()
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS training_time TEXT")
     conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS training_date DATE")
+    conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS training_time_clock TIME")
+    conn.commit()
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS training_venue TEXT")
     conn.commit()
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS opens_catalog BOOLEAN DEFAULT FALSE")
@@ -485,6 +489,23 @@ def upload_image_to_supabase(file_storage):
     return None
 
 
+def format_training_datetime(item):
+    """Builds a 'dd/mm/yyyy hh:mm:ss' style display string from an item's training_date/training_time_clock."""
+    if not item:
+        return "To be announced"
+    date_part = item.get("training_date")
+    time_part = item.get("training_time_clock")
+    date_str = date_part.strftime("%d/%m/%Y") if date_part else None
+    time_str = time_part.strftime("%H:%M:%S") if time_part else None
+    if date_str and time_str:
+        return f"{date_str} {time_str}"
+    if date_str:
+        return date_str
+    if time_str:
+        return time_str
+    return "To be announced"
+
+
 def send_training_email(to_email, customer_name, training_title, training_time, training_venue):
     """Sends a training confirmation email via SMTP. Returns (success: bool, error: str|None)."""
     if not to_email:
@@ -770,7 +791,7 @@ def webhook():
                 if flow.get("email"):
                     sent, err = send_training_email(
                         flow["email"], flow["name"], training_title,
-                        titem.get("training_time") if titem else None,
+                        format_training_datetime(titem),
                         titem.get("training_venue") if titem else None
                     )
                     if not sent:
@@ -905,7 +926,7 @@ def webhook():
                     ])
                 elif item.get("collects_registration"):
                     detail = item["body_text"] or ""
-                    time_line = item.get("training_time") or "To be announced"
+                    time_line = format_training_datetime(item)
                     venue_line = item.get("training_venue") or "To be announced"
                     detail = (detail + "\n\n" if detail else "") + f"\U0001F553 Time: {time_line}\n\U0001F4CD Venue: {venue_line}"
                     if item.get("image_url"):
@@ -1015,8 +1036,10 @@ a{color:#1565c0}
 <label><input type="checkbox" name="collects_registration" style="width:auto"> Collects training registration (starts a name/phone/address/email sign-up flow instead of just showing text)</label>
 <label><input type="checkbox" name="opens_catalog" style="width:auto"> Opens WhatsApp Catalog (shows the full scrollable product catalog with cart/ordering instead of a submenu -- requires Catalog setup)</label>
 <label><input type="checkbox" name="sellable" style="width:auto"> Sellable (adds an "I'm Interested" button -- customers can specify quantity and submit an order, saved to your Orders page)</label>
-<label>Training Time (only used if "Collects training registration" is ticked)</label>
-<input type="text" name="training_time">
+<label>Training Date (only used if "Collects training registration" is ticked)</label>
+<input type="date" name="training_date">
+<label>Training Time (24-hour, with seconds)</label>
+<input type="time" name="training_time_clock" step="1">
 <label>Training Venue (only used if the checkbox above is ticked)</label>
 <input type="text" name="training_venue">
 <button class="save" type="submit">Add Item</button>
@@ -1051,8 +1074,10 @@ a{display:inline-block;margin-top:10px}
 <label><input type="checkbox" name="collects_registration" {{ 'checked' if item.collects_registration else '' }} style="width:auto"> Collects training registration</label>
 <label><input type="checkbox" name="opens_catalog" {{ 'checked' if item.opens_catalog else '' }} style="width:auto"> Opens WhatsApp Catalog (full product catalog with cart/ordering)</label>
 <label><input type="checkbox" name="sellable" {{ 'checked' if item.sellable else '' }} style="width:auto"> Sellable (adds an "I'm Interested" button with quantity + order submission)</label>
-<label>Training Time (only used if "Collects training registration" is ticked)</label>
-<input type="text" name="training_time" value="{{ item.training_time or '' }}">
+<label>Training Date (only used if "Collects training registration" is ticked)</label>
+<input type="date" name="training_date" value="{{ item.training_date.strftime('%Y-%m-%d') if item.training_date else '' }}">
+<label>Training Time (24-hour, with seconds)</label>
+<input type="time" name="training_time_clock" step="1" value="{{ item.training_time_clock.strftime('%H:%M:%S') if item.training_time_clock else '' }}">
 <label>Training Venue (only used if the checkbox above is ticked)</label>
 <input type="text" name="training_venue" value="{{ item.training_venue or '' }}">
 <button class="save" type="submit">Save Changes</button>
@@ -1306,14 +1331,16 @@ def admin_add():
     opens_catalog = True if request.form.get('opens_catalog') else False
     sellable = True if request.form.get('sellable') else False
     training_time = request.form.get('training_time', '').strip() or None
+    training_date_str = request.form.get('training_date', '').strip() or None
+    training_time_clock_str = request.form.get('training_time_clock', '').strip() or None
     training_venue = request.form.get('training_venue', '').strip() or None
     image_url = upload_image_to_supabase(request.files.get('image'))
 
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue, opens_catalog, sellable) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue, opens_catalog, sellable)
+        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_date, training_time_clock, training_venue, opens_catalog, sellable) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable)
     )
     conn.commit()
     cursor.close()
@@ -1337,18 +1364,20 @@ def admin_edit(item_id):
         opens_catalog = True if request.form.get('opens_catalog') else False
         sellable = True if request.form.get('sellable') else False
         training_time = request.form.get('training_time', '').strip() or None
+        training_date_str = request.form.get('training_date', '').strip() or None
+        training_time_clock_str = request.form.get('training_time_clock', '').strip() or None
         training_venue = request.form.get('training_venue', '').strip() or None
 
         new_image_url = upload_image_to_supabase(request.files.get('image'))
         if new_image_url:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_venue=%s, opens_catalog=%s, sellable=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_venue, opens_catalog, sellable, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_date=%s, training_time_clock=%s, training_venue=%s, opens_catalog=%s, sellable=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable, item_id)
             )
         else:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_venue=%s, opens_catalog=%s, sellable=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_venue, opens_catalog, sellable, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_date=%s, training_time_clock=%s, training_venue=%s, opens_catalog=%s, sellable=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_date_str, training_time_clock_str, training_venue, opens_catalog, sellable, item_id)
             )
         conn.commit()
         cursor.close()
