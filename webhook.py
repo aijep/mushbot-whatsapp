@@ -1065,7 +1065,7 @@ a{color:#1565c0}
 
 <div class="addbox">
 <h3>Add New Menu Item</h3>
-<form method="post" action="{{ url_for('admin_add') }}" enctype="multipart/form-data">
+<form method="post" action="{{ url_for('admin_add') }}" enctype="multipart/form-data" onsubmit="return syncParentKey()" id="add_item_form">
 <label>Item Type</label>
 <select id="item_type" onchange="toggleItemType()">
 <option value="category">Category / Submenu (no special fields)</option>
@@ -1074,9 +1074,22 @@ a{color:#1565c0}
 <option value="info">Info page (just shows text/image)</option>
 </select>
 <label>Item Key (unique, lowercase, no spaces)</label>
-<input type="text" name="item_key" required>
-<label>Parent Key (use "main" for top-level, or another item's key for a submenu)</label>
-<input type="text" name="parent_key" value="main" required>
+<input type="text" name="item_key" required list="existing_keys_list">
+<datalist id="existing_keys_list">
+{% for key, label, depth in item_tree %}
+<option value="{{ key }}">{{ label }}</option>
+{% endfor %}
+</datalist>
+<label>Parent Key (pick where this item lives, or add a brand new category)</label>
+<select id="parent_key_select" onchange="toggleNewParent()">
+<option value="main">Top level (main menu)</option>
+{% for key, label, depth in item_tree %}
+<option value="{{ key }}">{{ label }}</option>
+{% endfor %}
+<option value="__new__">+ Add New Category...</option>
+</select>
+<input type="text" id="parent_key_new" name="parent_key_new_visible" placeholder="New category key, e.g. mushroom_beverage" style="display:none">
+<input type="hidden" name="parent_key" id="parent_key_hidden" value="main">
 <label>Title (button label shown in WhatsApp, keep short)</label>
 <input type="text" name="title" required>
 <label>Body Text (message sent when selected -- leave blank if this item has its own submenu)</label>
@@ -1122,6 +1135,33 @@ function toggleItemType() {
     document.getElementById('opens_catalog').checked = false;
 }
 toggleItemType();
+
+function toggleNewParent() {
+    var sel = document.getElementById('parent_key_select');
+    var newField = document.getElementById('parent_key_new');
+    if (sel.value === '__new__') {
+        newField.style.display = 'block';
+        newField.focus();
+    } else {
+        newField.style.display = 'none';
+    }
+}
+
+function syncParentKey() {
+    var sel = document.getElementById('parent_key_select');
+    var hidden = document.getElementById('parent_key_hidden');
+    if (sel.value === '__new__') {
+        var newVal = document.getElementById('parent_key_new').value.trim().toLowerCase().replace(/\\s+/g, '_');
+        if (!newVal) {
+            alert('Please type a key for the new category.');
+            return false;
+        }
+        hidden.value = newVal;
+    } else {
+        hidden.value = sel.value;
+    }
+    return true;
+}
 </script>
 
 </body></html>
@@ -1137,9 +1177,17 @@ a{display:inline-block;margin-top:10px}
 </style></head><body>
 <h2>Edit: {{ item.item_key }}</h2>
 {% if item.image_url %}<img src="{{ item.image_url }}" style="width:120px;height:120px;object-fit:cover;border-radius:6px;display:block;margin-bottom:10px">{% endif %}
-<form method="post" enctype="multipart/form-data">
-<label>Parent Key</label>
-<input type="text" name="parent_key" value="{{ item.parent_key }}" required>
+<form method="post" enctype="multipart/form-data" onsubmit="return syncParentKey()">
+<label>Parent Key (pick where this item lives, or add a brand new category)</label>
+<select id="parent_key_select" onchange="toggleNewParent()">
+<option value="main" {{ 'selected' if item.parent_key == 'main' else '' }}>Top level (main menu)</option>
+{% for key, label, depth in item_tree %}
+<option value="{{ key }}" {{ 'selected' if item.parent_key == key else '' }}>{{ label }}</option>
+{% endfor %}
+<option value="__new__">+ Add New Category...</option>
+</select>
+<input type="text" id="parent_key_new" name="parent_key_new_visible" placeholder="New category key, e.g. mushroom_beverage" style="display:none">
+<input type="hidden" name="parent_key" id="parent_key_hidden" value="{{ item.parent_key }}">
 <label>Title</label>
 <input type="text" name="title" value="{{ item.title }}" required>
 <label>Body Text</label>
@@ -1191,6 +1239,33 @@ function toggleItemType() {
     document.getElementById('collects_registration').checked = (t === 'training');
 }
 toggleItemType();
+
+function toggleNewParent() {
+    var sel = document.getElementById('parent_key_select');
+    var newField = document.getElementById('parent_key_new');
+    if (sel.value === '__new__') {
+        newField.style.display = 'block';
+        newField.focus();
+    } else {
+        newField.style.display = 'none';
+    }
+}
+
+function syncParentKey() {
+    var sel = document.getElementById('parent_key_select');
+    var hidden = document.getElementById('parent_key_hidden');
+    if (sel.value === '__new__') {
+        var newVal = document.getElementById('parent_key_new').value.trim().toLowerCase().replace(/\\s+/g, '_');
+        if (!newVal) {
+            alert('Please type a key for the new category.');
+            return false;
+        }
+        hidden.value = newVal;
+    } else {
+        hidden.value = sel.value;
+    }
+    return true;
+}
 </script>
 </body></html>
 """
@@ -1349,6 +1424,29 @@ def admin_logout():
     return redirect(url_for('admin_login'))
 
 
+def build_item_tree(items, exclude_key=None):
+    """Builds an ordered [(item_key, display_label, depth)] list reflecting the parent/child hierarchy."""
+    by_parent = {}
+    for it in items:
+        by_parent.setdefault(it["parent_key"], []).append(it)
+    for children in by_parent.values():
+        children.sort(key=lambda x: (x["sort_order"], x["id"]))
+
+    tree = []
+
+    def walk(parent_key, depth, seen):
+        for it in by_parent.get(parent_key, []):
+            if it["item_key"] == exclude_key or it["item_key"] in seen:
+                continue
+            seen.add(it["item_key"])
+            indent = "\u2014 " * depth
+            tree.append((it["item_key"], f"{indent}{it['title']} ({it['item_key']})", depth))
+            walk(it["item_key"], depth + 1, seen)
+
+    walk("main", 0, set())
+    return tree
+
+
 @app.route('/admin')
 @login_required
 def admin_panel():
@@ -1358,7 +1456,8 @@ def admin_panel():
     items = cursor.fetchall()
     cursor.close()
     conn.close()
-    return render_template_string(ADMIN_HTML, items=items, nav=render_template_string(NAV_HTML))
+    item_tree = build_item_tree(items)
+    return render_template_string(ADMIN_HTML, items=items, item_tree=item_tree, nav=render_template_string(NAV_HTML))
 
 
 @app.route('/admin/broadcast', methods=['GET', 'POST'])
@@ -1538,9 +1637,12 @@ def admin_edit(item_id):
 
     cursor.execute("SELECT * FROM menu_items WHERE id = %s", (item_id,))
     item = cursor.fetchone()
+    cursor.execute("SELECT * FROM menu_items ORDER BY parent_key ASC, sort_order ASC, id ASC")
+    all_items = cursor.fetchall()
     cursor.close()
     conn.close()
-    return render_template_string(EDIT_HTML, item=item)
+    item_tree = build_item_tree(all_items, exclude_key=item["item_key"] if item else None)
+    return render_template_string(EDIT_HTML, item=item, item_tree=item_tree)
 
 
 @app.route('/admin/delete/<int:item_id>', methods=['POST'])
