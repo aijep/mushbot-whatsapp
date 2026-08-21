@@ -759,53 +759,23 @@ def webhook():
                 return jsonify({"status": "received"}), 200
 
             if fstep == "awaiting_phone":
-                update_training_flow(sender, phone_number=text, step="awaiting_address")
-                send_message(sender, "Got it. Please share your address:")
-                return jsonify({"status": "received"}), 200
-
-            if fstep == "awaiting_address":
-                update_training_flow(sender, address=text, step="awaiting_email")
-                send_message(sender, "Please share your email address, or type 'skip':")
-                return jsonify({"status": "received"}), 200
-
-            if fstep == "awaiting_email":
-                email_value = None if text_lower in ["skip", "no", "none", "-"] else text
-                update_training_flow(sender, email=email_value, step="awaiting_confirm")
+                update_training_flow(sender, phone_number=text)
                 flow = get_training_flow(sender)
                 titem = get_item(flow["training_key"])
-                summary = (
-                    f"Please confirm your registration for {titem['title'] if titem else flow['training_key']}:\n\n"
-                    f"Name: {flow['name']}\nPhone: {flow['phone_number']}\n"
-                    f"Address: {flow['address']}\nEmail: {flow['email'] or 'N/A'}"
-                )
-                send_buttons(sender, summary, [
-                    {"id": "training_confirm", "title": "Join Training"},
-                    {"id": "training_cancel", "title": "Cancel"}
-                ])
-                return jsonify({"status": "received"}), 200
+                training_title = titem["title"] if titem else flow["training_key"]
 
-            if fstep == "awaiting_confirm":
-                if text_lower == "training_confirm":
-                    save_training_registration(flow)
-                    titem = get_item(flow["training_key"])
-                    training_title = titem["title"] if titem else flow["training_key"]
-                    clear_training_flow(sender)
-                    send_message(sender, "You're registered! We'll contact you with training details soon.")
-                    if flow.get("email"):
-                        sent, err = send_training_email(
-                            flow["email"], flow["name"], training_title,
-                            titem.get("training_time") if titem else None,
-                            titem.get("training_venue") if titem else None
-                        )
-                        if not sent:
-                            print("DEBUG: could not send training confirmation email:", err, flush=True)
-                    send_main_menu(sender)
-                elif text_lower == "training_cancel":
-                    clear_training_flow(sender)
-                    send_message(sender, "Registration cancelled.")
-                    send_main_menu(sender)
-                else:
-                    send_message(sender, "Please tap 'Join Training' or 'Cancel' above.")
+                save_training_registration(flow)
+                clear_training_flow(sender)
+                send_message(sender, f"You're registered for {training_title}! We'll contact you with more details soon.")
+                if flow.get("email"):
+                    sent, err = send_training_email(
+                        flow["email"], flow["name"], training_title,
+                        titem.get("training_time") if titem else None,
+                        titem.get("training_venue") if titem else None
+                    )
+                    if not sent:
+                        print("DEBUG: could not send training confirmation email:", err, flush=True)
+                send_main_menu(sender)
                 return jsonify({"status": "received"}), 200
 
         cart_flow = get_cart_flow(sender)
@@ -842,6 +812,22 @@ def webhook():
             parent_item = get_item(parent_key)
             header = (parent_item["title"] + ":") if parent_item else "Choose:"
             send_paginated_menu(sender, parent_key, header, page=page)
+            return jsonify({"status": "received"}), 200
+
+        if text_lower.startswith("jointraining__"):
+            item_key = text[len("jointraining__"):]
+            item = get_item(item_key)
+            if not item:
+                send_message(sender, "Sorry, that training is no longer available.")
+                send_main_menu(sender)
+                return jsonify({"status": "received"}), 200
+            start_training_flow(sender, item_key)
+            send_message(sender, "Great! Please share your full name:")
+            return jsonify({"status": "received"}), 200
+
+        if text_lower.startswith("skiptraining__"):
+            send_message(sender, "No problem! Let us know if you change your mind.")
+            send_main_menu(sender)
             return jsonify({"status": "received"}), 200
 
         if text_lower.startswith("interested__"):
@@ -918,10 +904,18 @@ def webhook():
                         {"id": "cart_browse_more", "title": "Browse More"}
                     ])
                 elif item.get("collects_registration"):
-                    if item["body_text"]:
-                        send_message(sender, item["body_text"])
-                    start_training_flow(sender, item["item_key"])
-                    send_message(sender, "Let's get you registered! Please share your full name:")
+                    detail = item["body_text"] or ""
+                    time_line = item.get("training_time") or "To be announced"
+                    venue_line = item.get("training_venue") or "To be announced"
+                    detail = (detail + "\n\n" if detail else "") + f"\U0001F553 Time: {time_line}\n\U0001F4CD Venue: {venue_line}"
+                    if item.get("image_url"):
+                        send_image(sender, item["image_url"], caption=detail)
+                    else:
+                        send_message(sender, detail)
+                    send_buttons(sender, "Would you like to join this training?", [
+                        {"id": f"jointraining__{item['item_key']}", "title": "Join Training"},
+                        {"id": f"skiptraining__{item['item_key']}", "title": "Skip"}
+                    ])
                 else:
                     if item["body_text"]:
                         if item.get("image_url"):
