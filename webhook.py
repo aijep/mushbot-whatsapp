@@ -1019,7 +1019,23 @@ button{padding:10px 20px;background:#2e7d32;color:#fff;border:none;cursor:pointe
 </form></body></html>
 """
 
-NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_trainings') }}">Trainings</a> | <a href="{{ url_for('admin_orders') }}">Orders</a> | <a href="{{ url_for('admin_broadcast') }}">Broadcast</a> | <a href="{{ url_for('admin_logout') }}">Logout</a></p>"""
+NAV_HTML = """<p><a href="{{ url_for('admin_panel') }}">Menu Items</a> | <a href="{{ url_for('admin_customers') }}">Customers</a> | <a href="{{ url_for('admin_trainings') }}">Trainings</a> | <a href="{{ url_for('admin_orders') }}">Orders</a> | <a href="{{ url_for('admin_broadcast') }}">Broadcast</a> | <a href="{{ url_for('admin_logout') }}">Logout</a>
+<span id="mushbot-clock" style="float:right;font-family:monospace;font-size:14px;color:#333;background:#f0f0f0;padding:4px 10px;border-radius:4px"></span>
+</p>
+<script>
+(function() {
+    function pad(n) { return n < 10 ? '0' + n : n; }
+    function updateClock() {
+        var now = new Date();
+        var time = pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+        var date = pad(now.getDate()) + '/' + pad(now.getMonth() + 1) + '/' + now.getFullYear();
+        var el = document.getElementById('mushbot-clock');
+        if (el) el.textContent = time + '  |  ' + date;
+    }
+    updateClock();
+    setInterval(updateClock, 1000);
+})();
+</script>"""
 
 ADMIN_HTML = """
 <!doctype html><html><head><title>Menu Admin</title>
