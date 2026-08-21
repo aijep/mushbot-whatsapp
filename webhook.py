@@ -86,6 +86,8 @@ def init_db():
     conn.commit()
     cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS opens_catalog BOOLEAN DEFAULT FALSE")
     conn.commit()
+    cursor.execute("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS sellable BOOLEAN DEFAULT FALSE")
+    conn.commit()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS customers (
         id SERIAL PRIMARY KEY,
@@ -112,6 +114,26 @@ def init_db():
         phone_number TEXT,
         address TEXT,
         email TEXT,
+        updated_at TIMESTAMP DEFAULT NOW()
+    )
+    """)
+    conn.commit()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS cart_state (
+        phone TEXT PRIMARY KEY,
+        items TEXT DEFAULT '[]',
+        updated_at TIMESTAMP DEFAULT NOW()
+    )
+    """)
+    conn.commit()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS cart_flow_state (
+        phone TEXT PRIMARY KEY,
+        item_key TEXT NOT NULL,
+        item_title TEXT,
+        step TEXT NOT NULL,
         updated_at TIMESTAMP DEFAULT NOW()
     )
     """)
@@ -298,6 +320,109 @@ def save_order(phone, order_data):
     cursor.close()
     conn.close()
     return order_id, product_items, total, currency
+
+
+def get_cart(phone):
+    import json
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT items FROM cart_state WHERE phone = %s", (phone,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if not row:
+        return []
+    try:
+        return json.loads(row[0])
+    except (TypeError, ValueError):
+        return []
+
+
+def add_to_cart(phone, item_key, title, quantity):
+    import json
+    items = get_cart(phone)
+    found = False
+    for it in items:
+        if it["item_key"] == item_key:
+            it["quantity"] += quantity
+            found = True
+            break
+    if not found:
+        items.append({"item_key": item_key, "title": title, "quantity": quantity})
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO cart_state (phone, items, updated_at) VALUES (%s, %s, NOW())
+        ON CONFLICT (phone) DO UPDATE SET items = EXCLUDED.items, updated_at = NOW()
+    """, (phone, json.dumps(items)))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return items
+
+
+def clear_cart(phone):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM cart_state WHERE phone = %s", (phone,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def get_cart_flow(phone):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM cart_flow_state WHERE phone = %s", (phone,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row
+
+
+def start_cart_flow(phone, item_key, item_title):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO cart_flow_state (phone, item_key, item_title, step)
+        VALUES (%s, %s, %s, 'awaiting_quantity')
+        ON CONFLICT (phone) DO UPDATE SET
+            item_key = EXCLUDED.item_key, item_title = EXCLUDED.item_title,
+            step = 'awaiting_quantity', updated_at = NOW()
+    """, (phone, item_key, item_title))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def clear_cart_flow(phone):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM cart_flow_state WHERE phone = %s", (phone,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def submit_cart_order(phone):
+    import json
+    items = get_cart(phone)
+    if not items:
+        return None
+    total_qty = sum(it["quantity"] for it in items)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO orders (customer_phone, items_json, order_text, status)
+        VALUES (%s, %s, %s, 'new') RETURNING id
+    """, (phone, json.dumps(items), f"{total_qty} item(s) via product interest flow"))
+    order_id = cursor.fetchone()[0]
+    conn.commit()
+    cursor.close()
+    conn.close()
+    clear_cart(phone)
+    return order_id, items
 
 
 def get_children(parent_key):
@@ -514,13 +639,28 @@ def send_buttons(to, text, buttons):
     return resp
 
 
-def send_menu(sender, parent_key, header):
-    items = get_children(parent_key)
-    if not items:
+def send_paginated_menu(sender, parent_key, header, page=0, page_size=9):
+    all_items = get_children(parent_key)
+    if not all_items:
         send_message(sender, "No options available right now. Type 'menu' to return.")
         return
-    rows = [{"id": item["item_key"], "title": item["title"][:24]} for item in items[:10]]
+
+    start = page * page_size
+    page_items = all_items[start:start + page_size]
+    has_next = (start + page_size) < len(all_items)
+    has_prev = page > 0
+
+    rows = [{"id": item["item_key"], "title": item["title"][:24]} for item in page_items]
+    if has_next:
+        rows.append({"id": f"__page_next__{parent_key}__{page + 1}", "title": "Next \u25b6"})
+    if has_prev:
+        rows.append({"id": f"__page_prev__{parent_key}__{page - 1}", "title": "\u25c0 Previous"})
+
     send_list(sender, header, "Choose", rows)
+
+
+def send_menu(sender, parent_key, header):
+    send_paginated_menu(sender, parent_key, header, page=0)
 
 
 def send_main_menu(sender, header="Main Menu:"):
@@ -668,6 +808,89 @@ def webhook():
                     send_message(sender, "Please tap 'Join Training' or 'Cancel' above.")
                 return jsonify({"status": "received"}), 200
 
+        cart_flow = get_cart_flow(sender)
+        if cart_flow and cart_flow["step"] == "awaiting_quantity":
+            try:
+                qty = int(text.strip())
+                if qty <= 0:
+                    raise ValueError()
+            except ValueError:
+                send_message(sender, "Please enter a valid whole number for quantity (e.g. 1, 2, 5):")
+                return jsonify({"status": "received"}), 200
+
+            add_to_cart(sender, cart_flow["item_key"], cart_flow["item_title"], qty)
+            clear_cart_flow(sender)
+            send_buttons(
+                sender,
+                f"Added {qty} x {cart_flow['item_title']} to your order.",
+                [
+                    {"id": "cart_browse_more", "title": "Browse More"},
+                    {"id": "cart_checkout", "title": "Checkout"}
+                ]
+            )
+            return jsonify({"status": "received"}), 200
+
+        if text_lower.startswith("__page_next__") or text_lower.startswith("__page_prev__"):
+            is_next = text_lower.startswith("__page_next__")
+            raw = text[len("__page_next__"):] if is_next else text[len("__page_prev__"):]
+            try:
+                parent_key, page_str = raw.rsplit("__", 1)
+                page = int(page_str)
+            except ValueError:
+                send_main_menu(sender)
+                return jsonify({"status": "received"}), 200
+            parent_item = get_item(parent_key)
+            header = (parent_item["title"] + ":") if parent_item else "Choose:"
+            send_paginated_menu(sender, parent_key, header, page=page)
+            return jsonify({"status": "received"}), 200
+
+        if text_lower.startswith("interested__"):
+            item_key = text[len("interested__"):]
+            item = get_item(item_key)
+            if not item:
+                send_message(sender, "Sorry, that item is no longer available.")
+                send_main_menu(sender)
+                return jsonify({"status": "received"}), 200
+            start_cart_flow(sender, item_key, item["title"])
+            send_message(sender, f"How many of \"{item['title']}\" would you like? Please reply with a number:")
+            return jsonify({"status": "received"}), 200
+
+        if text_lower in ["cart_browse_more", "browse more"]:
+            send_paginated_menu(sender, "products", "Products:", page=0)
+            return jsonify({"status": "received"}), 200
+
+        if text_lower in ["cart_checkout", "cart", "my cart", "checkout"]:
+            items = get_cart(sender)
+            if not items:
+                send_message(sender, "Your order list is empty. Browse products and tap 'I'm Interested' to add items.")
+                send_main_menu(sender)
+                return jsonify({"status": "received"}), 200
+            lines = ["Here's your order so far:\n"]
+            for it in items:
+                lines.append(f"- {it['title']} x{it['quantity']}")
+            lines.append("\nSubmit this order?")
+            send_buttons(sender, "\n".join(lines), [
+                {"id": "cart_submit", "title": "Submit Order"},
+                {"id": "cart_cancel", "title": "Cancel"}
+            ])
+            return jsonify({"status": "received"}), 200
+
+        if text_lower == "cart_submit":
+            result = submit_cart_order(sender)
+            if not result:
+                send_message(sender, "Your order list is empty.")
+            else:
+                order_id, items = result
+                send_message(sender, f"Order #{order_id} submitted! We'll be in touch shortly to confirm details. Thank you!")
+            send_main_menu(sender)
+            return jsonify({"status": "received"}), 200
+
+        if text_lower == "cart_cancel":
+            clear_cart(sender)
+            send_message(sender, "Order list cleared.")
+            send_main_menu(sender)
+            return jsonify({"status": "received"}), 200
+
         if text_lower in ["hi", "hello", "start"]:
             name = customer["name"] or ""
             send_main_menu(sender, f"Welcome back, {name}!\nChoose an option below:")
@@ -682,6 +905,18 @@ def webhook():
                     send_catalog_message(sender, body_text)
                 elif children:
                     send_menu(sender, item["item_key"], item["title"] + ":")
+                elif item.get("sellable"):
+                    if item["body_text"]:
+                        if item.get("image_url"):
+                            send_image(sender, item["image_url"], caption=item["body_text"])
+                        else:
+                            send_message(sender, item["body_text"])
+                    elif item.get("image_url"):
+                        send_image(sender, item["image_url"])
+                    send_buttons(sender, "Interested in this product?", [
+                        {"id": f"interested__{item['item_key']}", "title": "I'm Interested"},
+                        {"id": "cart_browse_more", "title": "Browse More"}
+                    ])
                 elif item.get("collects_registration"):
                     if item["body_text"]:
                         send_message(sender, item["body_text"])
@@ -785,6 +1020,7 @@ a{color:#1565c0}
 <input type="number" name="sort_order" value="0">
 <label><input type="checkbox" name="collects_registration" style="width:auto"> Collects training registration (starts a name/phone/address/email sign-up flow instead of just showing text)</label>
 <label><input type="checkbox" name="opens_catalog" style="width:auto"> Opens WhatsApp Catalog (shows the full scrollable product catalog with cart/ordering instead of a submenu -- requires Catalog setup)</label>
+<label><input type="checkbox" name="sellable" style="width:auto"> Sellable (adds an "I'm Interested" button -- customers can specify quantity and submit an order, saved to your Orders page)</label>
 <label>Training Time (only used if "Collects training registration" is ticked)</label>
 <input type="text" name="training_time">
 <label>Training Venue (only used if the checkbox above is ticked)</label>
@@ -820,6 +1056,7 @@ a{display:inline-block;margin-top:10px}
 <label><input type="checkbox" name="active" {{ 'checked' if item.active else '' }} style="width:auto"> Active</label>
 <label><input type="checkbox" name="collects_registration" {{ 'checked' if item.collects_registration else '' }} style="width:auto"> Collects training registration</label>
 <label><input type="checkbox" name="opens_catalog" {{ 'checked' if item.opens_catalog else '' }} style="width:auto"> Opens WhatsApp Catalog (full product catalog with cart/ordering)</label>
+<label><input type="checkbox" name="sellable" {{ 'checked' if item.sellable else '' }} style="width:auto"> Sellable (adds an "I'm Interested" button with quantity + order submission)</label>
 <label>Training Time (only used if "Collects training registration" is ticked)</label>
 <input type="text" name="training_time" value="{{ item.training_time or '' }}">
 <label>Training Venue (only used if the checkbox above is ticked)</label>
@@ -1073,6 +1310,7 @@ def admin_add():
     sort_order = int(request.form.get('sort_order', 0) or 0)
     collects_registration = True if request.form.get('collects_registration') else False
     opens_catalog = True if request.form.get('opens_catalog') else False
+    sellable = True if request.form.get('sellable') else False
     training_time = request.form.get('training_time', '').strip() or None
     training_venue = request.form.get('training_venue', '').strip() or None
     image_url = upload_image_to_supabase(request.files.get('image'))
@@ -1080,8 +1318,8 @@ def admin_add():
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue, opens_catalog) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue, opens_catalog)
+        "INSERT INTO menu_items (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue, opens_catalog, sellable) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (item_key, parent_key, title, body_text, image_url, sort_order, collects_registration, training_time, training_venue, opens_catalog, sellable)
     )
     conn.commit()
     cursor.close()
@@ -1103,19 +1341,20 @@ def admin_edit(item_id):
         active = True if request.form.get('active') else False
         collects_registration = True if request.form.get('collects_registration') else False
         opens_catalog = True if request.form.get('opens_catalog') else False
+        sellable = True if request.form.get('sellable') else False
         training_time = request.form.get('training_time', '').strip() or None
         training_venue = request.form.get('training_venue', '').strip() or None
 
         new_image_url = upload_image_to_supabase(request.files.get('image'))
         if new_image_url:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_venue=%s, opens_catalog=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_venue, opens_catalog, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, image_url=%s, collects_registration=%s, training_time=%s, training_venue=%s, opens_catalog=%s, sellable=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, new_image_url, collects_registration, training_time, training_venue, opens_catalog, sellable, item_id)
             )
         else:
             cursor.execute(
-                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_venue=%s, opens_catalog=%s WHERE id=%s",
-                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_venue, opens_catalog, item_id)
+                "UPDATE menu_items SET parent_key=%s, title=%s, body_text=%s, sort_order=%s, active=%s, collects_registration=%s, training_time=%s, training_venue=%s, opens_catalog=%s, sellable=%s WHERE id=%s",
+                (parent_key, title, body_text, sort_order, active, collects_registration, training_time, training_venue, opens_catalog, sellable, item_id)
             )
         conn.commit()
         cursor.close()
